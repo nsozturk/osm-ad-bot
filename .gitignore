@@ -1,0 +1,22 @@
+# OSM Storage Dump (authentication tokens)
+storagedump_*/
+*.har
+
+# Logs
+*.log
+/tmp/*.log
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OSM
+Training-OSM*/
+Training-OSM-adds-screen*/
+Training-OSM*.html
+*.zip
+storagedump_*.zip
