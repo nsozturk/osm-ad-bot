@@ -26,11 +26,6 @@ from storage_loader import StorageLoader
 OSM_ORIGIN = "https://en.onlinesoccermanager.com"
 OSM_TRAINING = f"{OSM_ORIGIN}/Training"
 
-# Resource types aborted at the network layer to keep CPU/bandwidth low.
-# Video ("media") is the big CPU sink; images/fonts are pure visuals we never
-# need headless. Scripts/XHR/fetch/CSS are kept so the OSM SPA still works.
-BLOCKED_RESOURCE_TYPES = {"media", "image", "font"}
-
 SELECTORS = {
     "wallet_container": ".wallet-container.bosscoin-wallet",
     "watch_ad_btn": ".product-free",
@@ -117,24 +112,12 @@ class OSMConductorBot:
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
             locale="en-GB",
         )
-        # Block heavy resources (video ads, images, fonts). The reward is faked
-        # via JS callbacks, so the actual ad video never needs to download/decode
-        # — this is the other big CPU/bandwidth sink. DOM selectors the bot
-        # relies on (wallet, .product-free, .reward-container) are unaffected.
-        await ctx.route("**/*", self._route_filter)
+        # NOTE: do NOT block media/image/font here. The rewarded ad runs in a
+        # googlesyndication safeframe whose resources must load for the reward
+        # to fire — blocking them breaks the reward entirely. Idle CPU is kept
+        # low by --disable-gpu (no swiftshader) + parking the conductor; and
+        # since the reward lands in a few seconds, watcher tabs close quickly.
         return ctx
-
-    async def _route_filter(self, route):
-        try:
-            if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
-                await route.abort()
-            else:
-                await route.continue_()
-        except Exception:
-            try:
-                await route.continue_()
-            except Exception:
-                pass
 
     async def _inject_storage(self):
         self._log("Injecting cookies & storage...")
@@ -543,6 +526,12 @@ class OSMConductorBot:
             self._log(f"{prefix}   Opening shop...")
             body = await page.query_selector("body.modal-open")
             if not body:
+                # Give the wallet up to 10s to render (slower under load / GPU-off)
+                # instead of failing on an immediate miss.
+                try:
+                    await page.wait_for_selector(SELECTORS["wallet_container"], timeout=10000)
+                except Exception:
+                    pass
                 wallet = await page.query_selector(SELECTORS["wallet_container"])
                 if wallet:
                     try:
