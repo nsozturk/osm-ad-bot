@@ -26,6 +26,11 @@ from storage_loader import StorageLoader
 OSM_ORIGIN = "https://en.onlinesoccermanager.com"
 OSM_TRAINING = f"{OSM_ORIGIN}/Training"
 
+# Resource types aborted at the network layer to keep CPU/bandwidth low.
+# Video ("media") is the big CPU sink; images/fonts are pure visuals we never
+# need headless. Scripts/XHR/fetch/CSS are kept so the OSM SPA still works.
+BLOCKED_RESOURCE_TYPES = {"media", "image", "font"}
+
 SELECTORS = {
     "wallet_container": ".wallet-container.bosscoin-wallet",
     "watch_ad_btn": ".product-free",
@@ -77,12 +82,10 @@ class OSMConductorBot:
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        print(line, flush=True)
-        # Also write to log file immediately if configured
-        if self.log_file and hasattr(self, '_log_fp'):
-            self._log_fp.write(line + "\n")
-            self._log_fp.flush()
+        # stdout is already redirected to the log file in __init__ when --log is
+        # set, so a single print() writes there; writing again would duplicate
+        # every line (the "double log" you saw).
+        print(f"[{ts}] {msg}", flush=True)
 
     def _should_stop(self) -> bool:
         return self._shutdown
@@ -94,7 +97,19 @@ class OSMConductorBot:
         self._log("Launching browser...")
         browser = await playwright.chromium.launch(
             headless=self.headless,
-            args=["--mute-audio", "--no-sandbox"]
+            args=[
+                "--mute-audio",
+                "--no-sandbox",
+                # Kill the software-WebGL (swiftshader) GPU process that was
+                # burning ~4 cores: with no real GPU in headless, OSM's
+                # WebGL/canvas was being rasterised on CPU. We fake ad
+                # completion, so we don't need any of it rendered.
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-gpu-compositing",
+                "--disable-accelerated-2d-canvas",
+                "--disable-dev-shm-usage",
+            ],
         )
         self._log(f"Browser launched (headless={self.headless}, watchers={self.watcher_tabs})")
         ctx = await browser.new_context(
@@ -102,7 +117,24 @@ class OSMConductorBot:
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
             locale="en-GB",
         )
+        # Block heavy resources (video ads, images, fonts). The reward is faked
+        # via JS callbacks, so the actual ad video never needs to download/decode
+        # — this is the other big CPU/bandwidth sink. DOM selectors the bot
+        # relies on (wallet, .product-free, .reward-container) are unaffected.
+        await ctx.route("**/*", self._route_filter)
         return ctx
+
+    async def _route_filter(self, route):
+        try:
+            if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
 
     async def _inject_storage(self):
         self._log("Injecting cookies & storage...")
@@ -117,6 +149,34 @@ class OSMConductorBot:
         # Accept the consent dialog once — cookies are domain-wide so later tabs stay clean
         await self._dismiss_consent(self.conductor_page, "[CONDUCTOR]")
         self._log("Conductor tab ready")
+
+    async def _park_conductor(self):
+        """During long idle waits, navigate the conductor to about:blank so the
+        OSM SPA stops running its render loop / ad refreshes / timers. Drops the
+        single idle tab from steady CPU to ~0 while we just sleep."""
+        try:
+            page = self.conductor_page
+            if page and not page.is_closed() and page.url != "about:blank":
+                await page.goto("about:blank")
+                self._log("[CONDUCTOR] parked (about:blank) — idle, no CPU")
+        except Exception as e:
+            self._log(f"[CONDUCTOR] park error: {e}")
+
+    async def _ensure_conductor_awake(self):
+        """Bring the conductor back onto OSM before a watch phase so the DOM
+        toast observer works and the frontend keeps the access_token fresh."""
+        try:
+            if not self.conductor_page or self.conductor_page.is_closed():
+                self.conductor_page = await self.context.new_page()
+            if not self.conductor_page.url.startswith(OSM_ORIGIN):
+                await self.conductor_page.goto(OSM_TRAINING, wait_until="domcontentloaded", timeout=60000)
+                await self.conductor_page.wait_for_selector("#page-content", timeout=30000)
+                await asyncio.sleep(2)
+                await self._dismiss_consent(self.conductor_page, "[CONDUCTOR]")
+                await self._start_mutation_observer()
+                self._log("[CONDUCTOR] awake on OSM")
+        except Exception as e:
+            self._log(f"[CONDUCTOR] wake error: {e}")
 
     async def _start_mutation_observer(self):
         """Install a JS mutation observer that watches for toast/alert nodes
@@ -312,6 +372,8 @@ class OSMConductorBot:
         self._log(f"⛔ RATE-LIMIT ({info.source}): Waiting {self._fmt_cooldown(info.cooldown_seconds)}")
         # Close all watcher tabs immediately
         await self._close_all_watchers()
+        # Park the conductor too — nothing to watch during cooldown, so idle at ~0 CPU
+        await self._park_conductor()
         # Sleep in chunks, log progress every minute or when < 2 min
         remaining = info.cooldown_seconds
         last_log = remaining
@@ -670,6 +732,9 @@ class OSMConductorBot:
                 continue
             
             # STEP 2: Rate-limit YOK — tüm watcher tablarını aç
+            # Wake the conductor back onto OSM (it may have been parked during the
+            # last wait) so the DOM toast observer + token refresh are live.
+            await self._ensure_conductor_awake()
             self._log("[CYCLE] Scout OK! Opening all {} watcher tabs...".format(self.watcher_tabs))
             await self._open_watchers()
             
@@ -730,6 +795,8 @@ class OSMConductorBot:
                 self.stats['watched']))
             
             # STEP 5: 5 dk bekle, sonra tekrar scout check
+            # Park the conductor for the idle gap so it draws ~0 CPU while waiting.
+            await self._park_conductor()
             self._log("[CYCLE] Waiting 5 min before next scout check...")
             wait_5min = 300
             while wait_5min > 0 and not self._should_stop():
