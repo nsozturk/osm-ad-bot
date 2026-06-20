@@ -20,3 +20,7 @@ Training-OSM-adds-screen*/
 Training-OSM*.html
 *.zip
 storagedump_*.zip
+
+# Transfer advisor derived data
+transfer-advisor/data/
+tmp/

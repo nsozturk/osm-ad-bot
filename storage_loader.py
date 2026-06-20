@@ -16,8 +16,6 @@ class StorageLoader:
 
     def _parse(self):
         cookies_path = self.dump_dir / "cookies.json"
-        local_path = self.dump_dir / "local.json"
-        session_path = self.dump_dir / "session.json"
 
         if cookies_path.exists():
             with open(cookies_path, "r", encoding="utf-8") as f:
@@ -49,24 +47,43 @@ class StorageLoader:
                         cookie.pop("expires", None)
                     self.cookies.append(cookie)
 
-        def parse_storage(path: Path):
+        def parse_storage(name: str):
+            # Supports two StorageDump layouts:
+            #   - old:  <name>.json           -> {"data": [ {key, metadata, value}, ... ]}
+            #   - new:  <name>/part-*.json    -> each file is a list (or {"data": [...]})
             items = []
-            if path.exists():
-                with open(path, "r", encoding="utf-8") as f:
+            raw_entries = []
+
+            single = self.dump_dir / f"{name}.json"
+            multi_dir = self.dump_dir / name
+
+            if single.exists():
+                with open(single, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    for item in data.get("data", []):
-                        origin = item.get("metadata", {}).get("origin", "https://en.onlinesoccermanager.com")
-                        key = item["key"]
-                        value = item["value"]
-                        if isinstance(value, (dict, list)):
-                            value = json.dumps(value)
-                        else:
-                            value = str(value)
-                        items.append({"origin": origin, "key": key, "value": value})
+                raw_entries.extend(data.get("data", []) if isinstance(data, dict) else data)
+            elif multi_dir.is_dir():
+                def _part_key(p: Path):
+                    digits = "".join(ch for ch in p.stem if ch.isdigit())
+                    return int(digits) if digits else 0
+                for part in sorted(multi_dir.glob("part-*.json"), key=_part_key):
+                    with open(part, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    raw_entries.extend(data.get("data", []) if isinstance(data, dict) else data)
+
+            for item in raw_entries:
+                meta = item.get("metadata", {}) or {}
+                origin = meta.get("origin", "https://en.onlinesoccermanager.com")
+                key = item["key"]
+                value = item["value"]
+                if isinstance(value, (dict, list)):
+                    value = json.dumps(value)
+                else:
+                    value = str(value)
+                items.append({"origin": origin, "key": key, "value": value})
             return items
 
-        self.local_storage = parse_storage(local_path)
-        self.session_storage = parse_storage(session_path)
+        self.local_storage = parse_storage("local")
+        self.session_storage = parse_storage("session")
 
     async def inject(self, context):
         """Inject cookies and storage into a Playwright BrowserContext."""

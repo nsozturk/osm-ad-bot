@@ -114,6 +114,8 @@ class OSMConductorBot:
         await self.conductor_page.goto(OSM_TRAINING, wait_until="domcontentloaded", timeout=60000)
         await self.conductor_page.wait_for_selector("#page-content", timeout=30000)
         await asyncio.sleep(3)
+        # Accept the consent dialog once — cookies are domain-wide so later tabs stay clean
+        await self._dismiss_consent(self.conductor_page, "[CONDUCTOR]")
         self._log("Conductor tab ready")
 
     async def _start_mutation_observer(self):
@@ -161,6 +163,20 @@ class OSMConductorBot:
         for c in self.storage.cookies:
             if c["name"] == "refresh_token":
                 return c["value"]
+        return None
+
+    async def _get_live_access_token(self) -> Optional[str]:
+        """Read the access_token cookie the OSM frontend keeps auto-refreshed
+        in the live browser context. Lets API checks work WITHOUT
+        OSM_CLIENT_ID / OSM_CLIENT_SECRET (the page handles the refresh)."""
+        if not self.context:
+            return None
+        try:
+            for c in await self.context.cookies(OSM_ORIGIN):
+                if c["name"] == "access_token" and c.get("value"):
+                    return c["value"]
+        except Exception:
+            pass
         return None
 
     async def _refresh_access_token(self) -> Optional[str]:
@@ -225,11 +241,14 @@ class OSMConductorBot:
 
     async def _api_get(self, endpoint: str) -> dict:
         import httpx
-        token = None
-        for c in self.storage.cookies:
-            if c["name"] == "access_token":
-                token = c["value"]
-                break
+        # Prefer the live browser cookie (frontend keeps it fresh), then the
+        # dump's token, then a client-credential refresh as last resort.
+        token = await self._get_live_access_token()
+        if not token:
+            for c in self.storage.cookies:
+                if c["name"] == "access_token":
+                    token = c["value"]
+                    break
         if not token:
             token = await self._refresh_access_token()
         if not token:
@@ -244,7 +263,9 @@ class OSMConductorBot:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, headers=headers, timeout=10)
             if resp.status_code in (401, 403):
-                token = await self._refresh_access_token()
+                # Token stale — re-read the live cookie (frontend may have just
+                # refreshed it) before falling back to a credential refresh.
+                token = await self._get_live_access_token() or await self._refresh_access_token()
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
                     resp = await client.get(url, headers=headers, timeout=10)
@@ -367,6 +388,45 @@ class OSMConductorBot:
         self._log("[WATCHERS] All watchers confirmed closed")
 
     # ------------------------------------------------------------------
+    # Consent dialog (Funding Choices / GDPR)
+    # ------------------------------------------------------------------
+    async def _dismiss_consent(self, page: Page, prefix: str = "") -> bool:
+        """The Funding Choices CMP renders a `.fc-consent-root` whose
+        `.fc-dialog-overlay` intercepts ALL pointer events, so every click
+        times out. Accept it via the 'Consent' CTA; if that fails, rip the
+        overlay/root out of the DOM so clicks go through. Returns True if a
+        dialog was found."""
+        try:
+            root = await page.query_selector(".fc-consent-root")
+            if not root:
+                return False
+            self._log(f"{prefix}   [CONSENT] dialog detected, dismissing...")
+            for sel in (".fc-cta-consent", "button.fc-cta-consent",
+                        ".fc-confirm-choices", "[aria-label='Consent']"):
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click(timeout=5000)
+                        await page.wait_for_selector(
+                            ".fc-consent-root", state="detached", timeout=8000)
+                        self._log(f"{prefix}   [CONSENT] accepted via {sel}")
+                        return True
+                except Exception:
+                    continue
+            # Fallback: forcibly remove overlay + root so clicks aren't blocked
+            await page.evaluate("""
+                () => {
+                    document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay')
+                        .forEach(el => el.remove());
+                }
+            """)
+            self._log(f"{prefix}   [CONSENT] force-removed overlay from DOM")
+            return True
+        except Exception as e:
+            self._log(f"{prefix}   [CONSENT] dismiss error: {e}")
+            return False
+
+    # ------------------------------------------------------------------
     # Single ad watch (same as before but isolated per tab)
     # ------------------------------------------------------------------
     async def _watcher_loop(self, page: Page, tab_id: int):
@@ -414,13 +474,21 @@ class OSMConductorBot:
         prefix = f"[W{tab_id}]"
         self._log(f"{prefix} ▶ Starting ad watch...")
         try:
+            # Clear any GDPR/consent overlay that would intercept clicks
+            await self._dismiss_consent(page, prefix)
+
             # Open shop
             self._log(f"{prefix}   Opening shop...")
             body = await page.query_selector("body.modal-open")
             if not body:
                 wallet = await page.query_selector(SELECTORS["wallet_container"])
                 if wallet:
-                    await wallet.click()
+                    try:
+                        await wallet.click(timeout=10000)
+                    except Exception:
+                        # Consent overlay may have appeared late — dismiss & retry once
+                        await self._dismiss_consent(page, prefix)
+                        await wallet.click(timeout=10000)
                     try:
                         await page.wait_for_selector("body.modal-open", timeout=15000)
                         self._log(f"{prefix}   Shop opened")
