@@ -9,6 +9,7 @@ OSM Ad Watcher Bot — Continuous Scheduler Edition
 """
 import argparse
 import asyncio
+import base64
 import json
 import signal
 import sys
@@ -101,6 +102,8 @@ class OSMAdBot:
         self.context: Optional[BrowserContext] = None
         self.pages: list[Page] = []
         self.storage = StorageLoader(dump_dir)
+        # Account id derived from the loaded dump's token — never hardcoded.
+        self.user_id = self._extract_user_id()
         self.stats = {"watched": 0, "errors": 0, "cooldowns": 0}
         self._shutdown = False
         self._cooldown = CooldownTracker()
@@ -308,15 +311,42 @@ class OSMAdBot:
             print(f"[!] Click failed: {e}")
             return False
 
+    def _extract_user_id(self) -> str:
+        """Derive the logged-in account id from the dump's token (JWT `sub`),
+        so no account id is ever hardcoded. Stable even if the token expired."""
+        def claim(token: str, *keys) -> str:
+            try:
+                payload = token.split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                data = json.loads(base64.urlsafe_b64decode(payload))
+                for k in keys:
+                    if data.get(k):
+                        return str(data[k])
+            except Exception:
+                pass
+            return ""
+        sources = (
+            ("access_token", ("sub",
+                "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier")),
+            ("forum_token", ("id",)),
+        )
+        for name, keys in sources:
+            for c in self.storage.cookies:
+                if c["name"] == name:
+                    uid = claim(c["value"], *keys)
+                    if uid:
+                        return uid
+        return ""
+
     async def _attempt_fake_ad_completion(self, page: Page) -> bool:
         try:
             result = await page.evaluate("""
-                () => {
+                (uid) => {
                     const results = [];
                     if (window.invokeApplixirVideoUnit) {
                         try {
                             window.invokeApplixirVideoUnit({zoneId: 1989, devId: 2999, gameId: 4074,
-                                userId: '965391039', status: 'ad-watched', reward: true});
+                                userId: uid, status: 'ad-watched', reward: true});
                             results.push('invokeApplixirVideoUnit called');
                         } catch(e) { results.push('invokeApplixirVideoUnit error: ' + e.message); }
                     }
@@ -355,7 +385,7 @@ class OSMAdBot:
                     });
                     return results;
                 }
-            """)
+            """, self.user_id)
             print(f"[JS] {result}")
             await asyncio.sleep(3)
             return True

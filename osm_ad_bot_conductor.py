@@ -10,6 +10,7 @@ All tabs are muted. Loop repeats forever.
 """
 import argparse
 import asyncio
+import base64
 import json
 import re
 import signal
@@ -62,6 +63,8 @@ class OSMConductorBot:
         self.log_file = log_file
 
         self.storage = StorageLoader(dump_dir)
+        # Account id derived from the loaded dump's token — never hardcoded.
+        self.user_id = self._extract_user_id()
         self.stats = {"watched": 0, "errors": 0, "cycles": 0}
         self._shutdown = False
 
@@ -202,6 +205,34 @@ class OSMConductorBot:
     # ------------------------------------------------------------------
     # Auth / API helpers
     # ------------------------------------------------------------------
+    def _extract_user_id(self) -> str:
+        """Derive the logged-in account id from the dump's token (JWT `sub`),
+        so no account id is ever hardcoded. The id is stable even when the
+        token itself is expired."""
+        def claim(token: str, *keys) -> str:
+            try:
+                payload = token.split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                data = json.loads(base64.urlsafe_b64decode(payload))
+                for k in keys:
+                    if data.get(k):
+                        return str(data[k])
+            except Exception:
+                pass
+            return ""
+        sources = (
+            ("access_token", ("sub",
+                "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier")),
+            ("forum_token", ("id",)),
+        )
+        for name, keys in sources:
+            for c in self.storage.cookies:
+                if c["name"] == name:
+                    uid = claim(c["value"], *keys)
+                    if uid:
+                        return uid
+        return ""
+
     def _get_refresh_token(self) -> Optional[str]:
         for c in self.storage.cookies:
             if c["name"] == "refresh_token":
@@ -231,7 +262,10 @@ class OSMConductorBot:
         client_id = os.environ.get("OSM_CLIENT_ID", "")
         client_secret = os.environ.get("OSM_CLIENT_SECRET", "")
         if not client_id or not client_secret:
-            self._log("! OSM_CLIENT_ID / OSM_CLIENT_SECRET env vars not set")
+            if not getattr(self, "_warned_no_creds", False):
+                self._log("! OSM_CLIENT_ID / OSM_CLIENT_SECRET not set — API rate-limit "
+                          "check disabled, falling back to DOM detection (this is fine)")
+                self._warned_no_creds = True
             return None
         try:
             async with httpx.AsyncClient() as client:
@@ -321,10 +355,13 @@ class OSMConductorBot:
     # Rate-limit detection (dual source)
     # ------------------------------------------------------------------
     async def _check_api_rate_limit(self) -> Optional[RateLimitInfo]:
-        self._log("  [CHECK] API rate limit check...")
         body = await self._api_get("/api/v1/user/caps/actions/Shop/0")
         if "error" in body:
-            self._log("  [CHECK] API error, skipping")
+            # API check unavailable (no creds / no live token). Say it once —
+            # DOM toast detection still catches rate-limits every cycle.
+            if not getattr(self, "_warned_api_skip", False):
+                self._log("  [CHECK] API rate-limit check unavailable — relying on DOM detection")
+                self._warned_api_skip = True
             return None
         is_limited = body.get("isCapReached", False) and not body.get("isClaimable", False)
         ts = body.get("timestampUntilUnreached")
@@ -468,8 +505,80 @@ class OSMConductorBot:
             self._log(f"{prefix}   [CONSENT] force-removed overlay from DOM")
             return True
         except Exception as e:
+            msg = str(e)
+            # Benign: page was navigating/closing while we probed — not an error.
+            if ("Execution context was destroyed" in msg
+                    or "navigation" in msg.lower() or "closed" in msg.lower()):
+                return False
             self._log(f"{prefix}   [CONSENT] dismiss error: {e}")
             return False
+
+    async def _clear_overlays(self, page: Page, prefix: str = "") -> bool:
+        """Remove the click-blocking overlay LAYERS (consent root + any
+        `.modal-backdrop`, e.g. from a generic OSM popup stacked on the shop)
+        by stripping just those divs from the DOM. We never click a modal's
+        buttons — those can trigger navigation — so a real (trusted) click can
+        then land on the target. Modal dialogs themselves are left intact."""
+        try:
+            removed = await page.evaluate("""
+                () => {
+                    let n = 0;
+                    document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, .modal-backdrop')
+                        .forEach(el => { try { el.remove(); n++; } catch(e){} });
+                    return n;
+                }
+            """)
+            if removed:
+                self._log(f"{prefix}   [OVERLAY] cleared {removed} blocking layer(s)")
+            return removed > 0
+        except Exception:
+            return False
+
+    async def _robust_click(self, page: Page, selector: str,
+                            prefix: str = "", label: str = "element",
+                            timeout: int = 8000) -> bool:
+        """Click an element even when a modal backdrop / consent overlay sits on
+        top. Tries a real click; on failure clears overlays + generic modals and
+        retries; last resort dispatches the DOM click directly (ignores pointer
+        interception). Re-queries each attempt so a stale handle can't break it."""
+        async def fresh():
+            # wait_for_selector (not bare query) so a briefly detached / late
+            # re-rendering element isn't seen as missing.
+            try:
+                return await page.wait_for_selector(selector, timeout=6000, state="attached")
+            except Exception:
+                return None
+        # 1) real click
+        el = await fresh()
+        if el:
+            try:
+                await el.click(timeout=timeout)
+                return True
+            except Exception:
+                pass
+        # 2) strip blocking overlays/backdrops (no button clicks → no navigation)
+        #    then retry a REAL, trusted click — important for rewarded video,
+        #    which needs a genuine user gesture to start.
+        await self._clear_overlays(page, prefix)
+        el = await fresh()
+        if el:
+            try:
+                await el.click(timeout=timeout)
+                return True
+            except Exception:
+                pass
+        # 3) last resort: dispatch the DOM click directly. Fine for non-gesture
+        #    actions (e.g. opening the shop); may not start a gated video, but
+        #    better than giving up.
+        el = await fresh()
+        if el:
+            try:
+                await el.evaluate("e => e.click()")
+                self._log(f"{prefix}   [{label}] clicked via JS dispatch")
+                return True
+            except Exception as e:
+                self._log(f"{prefix}   ! {label} click failed: {e}")
+        return False
 
     # ------------------------------------------------------------------
     # Single ad watch (same as before but isolated per tab)
@@ -534,12 +643,10 @@ class OSMConductorBot:
                     pass
                 wallet = await page.query_selector(SELECTORS["wallet_container"])
                 if wallet:
-                    try:
-                        await wallet.click(timeout=10000)
-                    except Exception:
-                        # Consent overlay may have appeared late — dismiss & retry once
-                        await self._dismiss_consent(page, prefix)
-                        await wallet.click(timeout=10000)
+                    if not await self._robust_click(page, SELECTORS["wallet_container"],
+                                                    prefix, "wallet"):
+                        self._log(f"{prefix}   ! Could not click wallet")
+                        return False
                     try:
                         await page.wait_for_selector("body.modal-open", timeout=15000)
                         self._log(f"{prefix}   Shop opened")
@@ -555,22 +662,37 @@ class OSMConductorBot:
             self._log(f"{prefix}   Looking for 'Watch ad' button...")
             buttons = await page.query_selector_all(SELECTORS["watch_ad_btn"])
             if not buttons:
-                self._log(f"{prefix}   ! No 'Watch ad' button found")
+                # When the shop can't load the ad slot, OSM pops a generic
+                # "Oops, something went wrong" modal — report that distinctly so
+                # it's not confused with a missing button.
+                err = await page.evaluate("""() => {
+                    const c = document.querySelector('#genericModalContainer');
+                    const t = c ? (c.innerText || '') : '';
+                    return /something went wrong|oops/i.test(t)
+                        ? t.replace(/\\s+/g,' ').trim().slice(0,80) : '';
+                }""")
+                if err:
+                    self._log(f"{prefix}   ! OSM error modal (\"{err}\") — ad slot not served, retry")
+                else:
+                    self._log(f"{prefix}   ! No 'Watch ad' button found")
                 return False
             self._log(f"{prefix}   Found {len(buttons)} button(s)")
 
             self._log(f"{prefix}   Clicking 'Watch ad'...")
-            await buttons[0].click()
+            if not await self._robust_click(page, SELECTORS["watch_ad_btn"],
+                                            prefix, "watch-ad"):
+                self._log(f"{prefix}   ! Could not click 'Watch ad'")
+                return False
             await asyncio.sleep(2)
             self._log(f"{prefix}   Ad started")
 
             # Fake completion attempt
             self._log(f"{prefix}   Trying fake completion...")
             await page.evaluate("""
-                () => {
+                (uid) => {
                     if (window.invokeApplixirVideoUnit) {
                         try { window.invokeApplixirVideoUnit({zoneId:1989,devId:2999,gameId:4074,
-                            userId:'965391039',status:'ad-watched',reward:true}); } catch(e){}
+                            userId:uid,status:'ad-watched',reward:true}); } catch(e){}
                     }
                     if (window.adinplay && window.adinplay.rewardedVideo) {
                         try { window.adinplay.rewardedVideo.onAdRewarded(); } catch(e){}
@@ -578,7 +700,7 @@ class OSMConductorBot:
                     ['applixirAdCompleted','adCompleted','rewardedAdCompleted','videoFinished']
                         .forEach(n => { try { document.dispatchEvent(new Event(n, {bubbles:true})); } catch(e){} });
                 }
-            """)
+            """, self.user_id)
             await asyncio.sleep(3)
             self._log(f"{prefix}   Fake callbacks dispatched")
 
@@ -609,13 +731,13 @@ class OSMConductorBot:
             # Try fake again
             self._log(f"{prefix}   Retrying fake completion...")
             await page.evaluate("""
-                () => {
+                (uid) => {
                     if (window.invokeApplixirVideoUnit) {
                         try { window.invokeApplixirVideoUnit({zoneId:1989,devId:2999,gameId:4074,
-                            userId:'965391039',status:'ad-watched',reward:true}); } catch(e){}
+                            userId:uid,status:'ad-watched',reward:true}); } catch(e){}
                     }
                 }
-            """)
+            """, self.user_id)
             await asyncio.sleep(3)
 
             # Final check
@@ -857,6 +979,17 @@ def main():
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        # Surface startup/runtime crashes IN THE LOG FILE (stderr tracebacks
+        # otherwise vanish when stdout is redirected to the log). Common cause:
+        # missing Playwright browser binary → run `python3 -m playwright install chromium`.
+        import traceback
+        bot._log("")
+        bot._log("!!! FATAL: {}: {}".format(type(e).__name__, e))
+        for line in traceback.format_exc().splitlines():
+            bot._log("    " + line)
+        if "Executable doesn't exist" in str(e):
+            bot._log("    → FIX: python3 -m playwright install chromium")
     finally:
         bot.print_summary()
         if bot.log_file and hasattr(bot, '_log_fp'):
