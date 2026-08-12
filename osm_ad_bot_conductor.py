@@ -168,9 +168,20 @@ class OSMConductorBot:
         """Install a JS mutation observer that watches for toast/alert nodes
         containing the rate-limit text and pushes cooldown minutes to a
         window.__osm_toast_queue array so we can read it from Python."""
-        await self.conductor_page.evaluate("""
+        page = self.conductor_page
+        if not page or page.is_closed():
+            return False
+        try:
+            installed = await page.evaluate("""
             () => {
-                window.__osm_toast_queue = [];
+                if (!document.body) return false;
+                const existing = window.__osm_toast_observer;
+                if (existing && typeof existing.disconnect === 'function') {
+                    existing.disconnect();
+                }
+                if (!Array.isArray(window.__osm_toast_queue)) {
+                    window.__osm_toast_queue = [];
+                }
                 const observer = new MutationObserver((mutations) => {
                     mutations.forEach((mutation) => {
                         mutation.addedNodes.forEach((node) => {
@@ -184,23 +195,77 @@ class OSMConductorBot:
                         });
                     });
                 });
+                window.__osm_toast_observer = observer;
+                window.__osm_toast_observer_body = document.body;
                 observer.observe(document.body, { childList: true, subtree: true });
+                return true;
             }
-        """)
-        self._log("DOM toast observer installed")
+            """)
+        except Exception as exc:
+            if not getattr(self, "_dom_observer_warning_active", False):
+                self._log(f"  [CHECK] DOM toast observer unavailable: {exc}")
+                self._dom_observer_warning_active = True
+            return False
+        if installed:
+            self._dom_observer_warning_active = False
+            self._log("DOM toast observer installed")
+        return bool(installed)
 
     async def _read_dom_cooldown(self) -> Optional[int]:
-        """Read any newly-seen toast cooldown minutes and clear the queue."""
-        result = await self.conductor_page.evaluate("""
-            () => {
-                const q = window.__osm_toast_queue;
-                if (q.length === 0) return null;
-                const maxVal = Math.max(...q);
-                window.__osm_toast_queue = [];
-                return maxVal;
-            }
-        """)
-        return result
+        """Read newly-seen cooldown minutes; self-heal after page reloads.
+
+        The toast queue and observer are page-scoped JavaScript globals. OSM can
+        replace the document while refreshing its session, so a missing queue is
+        an expected transient state and must never terminate the conductor.
+        """
+        page = self.conductor_page
+        if not page or page.is_closed():
+            await self._ensure_conductor_awake()
+            page = self.conductor_page
+            if not page or page.is_closed():
+                return None
+
+        try:
+            result = await page.evaluate("""
+                () => {
+                    const q = window.__osm_toast_queue;
+                    const observer = window.__osm_toast_observer;
+                    const observerBody = window.__osm_toast_observer_body;
+                    if (!Array.isArray(q) || !observer ||
+                            typeof observer.disconnect !== 'function' ||
+                            observerBody !== document.body) {
+                        return { ready: false, value: null };
+                    }
+                    if (q.length === 0) {
+                        return { ready: true, value: null };
+                    }
+                    const values = q.map(Number).filter(Number.isFinite);
+                    q.length = 0;
+                    return {
+                        ready: true,
+                        value: values.length ? Math.max(...values) : null,
+                    };
+                }
+            """)
+        except Exception as exc:
+            if not getattr(self, "_dom_check_warning_active", False):
+                self._log(f"  [CHECK] DOM cooldown check interrupted — self-healing: {exc}")
+                self._dom_check_warning_active = True
+            try:
+                await self._ensure_conductor_awake()
+                await self._start_mutation_observer()
+            except Exception:
+                pass
+            return None
+
+        if not isinstance(result, dict) or not result.get("ready"):
+            if await self._start_mutation_observer():
+                self._log("  [CHECK] DOM toast observer restored after page reload")
+            return None
+
+        self._dom_check_warning_active = False
+        value = result.get("value")
+        return value if isinstance(value, int) and value > 0 else None
 
     # ------------------------------------------------------------------
     # Auth / API helpers

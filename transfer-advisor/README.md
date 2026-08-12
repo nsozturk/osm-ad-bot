@@ -21,6 +21,7 @@ kadro analizi + alışveriş planı + en iyi öneri listesini basar.
 |---|---|
 | `advisor.py` | **Ana giriş.** Ayıklama + öneriyi tek komutta zincirler. |
 | `har_extract.py` | HAR → `data/squad.json`, `data/transfers.json`, `data/finances.json`. |
+| `live_fetch.py` | OSM API'den canlı kadro, transfer ve para verisini çeker. |
 | `recommend.py` | Skorlama + alışveriş planı + rapor motoru. |
 | `positions.py` | OSM pozisyon kodlarının çözümlenmesi (1=ATT, 2=MID, 3=DEF, 4=GK). |
 
@@ -60,6 +61,22 @@ python3 transfer-advisor/recommend.py --from-json transfer-advisor/data --budget
 ```
 
 Tüm bayraklar için: `python3 transfer-advisor/recommend.py --help`
+
+### Chrome Storage Dump ile canlı veri
+
+Chrome Storage Export ZIP'i yeni `access_token` ve `refresh_token` içeriyorsa
+HAR oluşturmadan güncel veriyi çekebilirsin:
+
+```bash
+python3 transfer-advisor/live_fetch.py \
+  --storage-dump /Users/ns0bj/Downloads/storagedump_en.onlinesoccermanager.com_YYYY-MM-DDTHH-MM-SS-sssZ.zip
+```
+
+Bu mod ZIP'ten yalnızca `cookies.json` içindeki iki tokenı **belleğe** alır;
+tokenları yazdırmaz ve `transfer-advisor/data/` altına kaydetmez. Böylece bir
+sonraki çalıştırma için yeni dump gerekir. ZIP'teki access tokenın takım
+bağlamı ve saklanan takım anahtarları doğru hedefi otomatik seçer; gerektiğinde
+`--league` ve `--team` ile geçersiz kılabilirsin.
 
 ## Skor mantığı
 
@@ -102,4 +119,6 @@ böylece aynı mevkiye gereksiz yığılma olmaz ve bütçe en yüksek OVR kazan
 
 OSM'i tarayıcıda aç → DevTools → Network → kadro ve transfer listesi sayfalarını
 gez → ilgili sekmeyi **"Save all as HAR"** ile kaydet → bu klasöre (ya da `--kadro`
-/ `--transfers` ile verdiğin yola) koy.
+/ `--transfers` ile verdiğin yola) koy. Alternatif olarak Chrome Storage Export
+ZIP'iyle `live_fetch.py --storage-dump <zip>` kullanabilirsin; her iki girdi de
+token içerebileceği için Git'e eklenmemelidir.

@@ -395,6 +395,8 @@ def run(args):
     squad = parse_squad(raw_squad)
     my_ids = {p.id for p in squad}
     candidates = parse_transfers(raw_transfers, my_ids)
+    own_listed_count = sum(1 for candidate in candidates if candidate.in_squad)
+    market_candidate_count = len(candidates) - own_listed_count
 
     # butce: kullanici verdiyse o, yoksa balance + savings
     if args.budget is not None:
@@ -447,7 +449,8 @@ def run(args):
 
     print()
     print(f"Butce: {fmt_money(budget)} ({budget:,})   |   Formasyon: {args.formation}"
-          f"   |   Transfer adayi: {len(candidates)} (kendi 2 oyuncum haric)")
+          f"   |   Transfer adayi: {market_candidate_count} "
+          f"(kendi {own_listed_count} oyuncum haric)")
     print()
     print_squad_report(squad_summary)
     basket, remaining = build_shopping_plan(scored, squad_summary, formation, budget)

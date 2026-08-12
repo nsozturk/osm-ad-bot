@@ -1,0 +1,1 @@
+"""OSM bot regression tests."""
