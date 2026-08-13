@@ -18,10 +18,15 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from playwright.async_api import async_playwright, BrowserContext, Page
 
+from auto_training import (
+    AutoTrainingManager,
+    extract_team_context,
+    load_training_profile,
+)
 from storage_loader import StorageLoader
 
 OSM_ORIGIN = "https://en.onlinesoccermanager.com"
@@ -53,7 +58,12 @@ class RateLimitInfo:
 class OSMConductorBot:
     def __init__(self, dump_dir: str, headless: bool = False,
                  watcher_tabs: int = 1, poll_interval: int = 30,
-                 ad_duration: int = 30, log_file: Optional[str] = None):
+                 ad_duration: int = 30, log_file: Optional[str] = None,
+                 auto_training: bool = False,
+                 training_poll_interval: int = 60,
+                 training_har_profile: Optional[str] = None,
+                 normal_training_timer_id: Optional[int] = None,
+                 universal_training_timer_id: Optional[int] = None):
         self.dump_dir = dump_dir
         self.headless = headless
         self.watcher_tabs = min(watcher_tabs, 9)
@@ -63,6 +73,20 @@ class OSMConductorBot:
         self.log_file = log_file
 
         self.storage = StorageLoader(dump_dir)
+        self.auto_training = auto_training
+        self.training_poll_interval = max(15, training_poll_interval)
+        self.training_profile = load_training_profile(training_har_profile)
+        self.normal_training_timer_id = (
+            normal_training_timer_id or self.training_profile.normal_timer_id
+        )
+        self.universal_training_timer_id = (
+            universal_training_timer_id or self.training_profile.universal_timer_id
+        )
+        self.training_league_id, self.training_team_id = extract_team_context(
+            self.storage, self.training_profile
+        )
+        self.training_manager: Optional[AutoTrainingManager] = None
+        self._training_task: Optional[asyncio.Task] = None
         # Account id derived from the loaded dump's token — never hardcoded.
         self.user_id = self._extract_user_id()
         self.stats = {"watched": 0, "errors": 0, "cycles": 0}
@@ -130,7 +154,15 @@ class OSMConductorBot:
     async def _open_conductor(self):
         self.conductor_page = await self.context.new_page()
         await self.conductor_page.goto(OSM_TRAINING, wait_until="domcontentloaded", timeout=60000)
-        await self.conductor_page.wait_for_selector("#page-content", timeout=30000)
+        try:
+            await self.conductor_page.wait_for_selector("#page-content", timeout=30000)
+        except Exception as exc:
+            if "login" in self.conductor_page.url.lower():
+                raise RuntimeError(
+                    "StorageDump session is no longer valid after logout/login; "
+                    "export a fresh post-login StorageDump and run again"
+                ) from exc
+            raise
         await asyncio.sleep(3)
         # Accept the consent dialog once — cookies are domain-wide so later tabs stay clean
         await self._dismiss_consent(self.conductor_page, "[CONDUCTOR]")
@@ -304,6 +336,36 @@ class OSMConductorBot:
                 return c["value"]
         return None
 
+    async def _get_live_refresh_token(self) -> Optional[str]:
+        if self.context:
+            try:
+                for c in await self.context.cookies(OSM_ORIGIN):
+                    if c["name"] == "refresh_token" and c.get("value"):
+                        return c["value"]
+            except Exception:
+                pass
+        return self._get_refresh_token()
+
+    async def _replace_runtime_cookie(self, name: str, value: str) -> None:
+        found = False
+        for cookie in self.storage.cookies:
+            if cookie["name"] == name:
+                cookie["value"] = value
+                found = True
+                break
+        if not found:
+            self.storage.cookies.append({
+                "name": name, "value": value,
+                "domain": "en.onlinesoccermanager.com", "path": "/",
+                "httpOnly": False, "secure": True, "sameSite": "None",
+            })
+        if self.context:
+            await self.context.add_cookies([{
+                "name": name, "value": value,
+                "domain": "en.onlinesoccermanager.com", "path": "/",
+                "httpOnly": False, "secure": True, "sameSite": "None",
+            }])
+
     async def _get_live_access_token(self) -> Optional[str]:
         """Read the access_token cookie the OSM frontend keeps auto-refreshed
         in the live browser context. Lets API checks work WITHOUT
@@ -321,7 +383,7 @@ class OSMConductorBot:
     async def _refresh_access_token(self) -> Optional[str]:
         import httpx
         import os
-        refresh = self._get_refresh_token()
+        refresh = await self._get_live_refresh_token()
         if not refresh:
             return None
         client_id = os.environ.get("OSM_CLIENT_ID", "")
@@ -344,7 +406,7 @@ class OSMConductorBot:
                     },
                     headers={
                         "Content-Type": "application/x-www-form-urlencoded",
-                        "AppVersion": "3.248.3",
+                        "AppVersion": "3.251.0",
                         "PlatformId": "13",
                         "Origin": "https://en.onlinesoccermanager.com",
                         "Referer": "https://en.onlinesoccermanager.com/",
@@ -354,34 +416,24 @@ class OSMConductorBot:
                 data = resp.json()
                 new_token = data.get("access_token")
                 if new_token:
-                    # Update internal cookies
-                    found = False
-                    for c in self.storage.cookies:
-                        if c["name"] == "access_token":
-                            c["value"] = new_token
-                            found = True
-                            break
-                    if not found:
-                        self.storage.cookies.append({
-                            "name": "access_token", "value": new_token,
-                            "domain": "en.onlinesoccermanager.com", "path": "/",
-                            "httpOnly": False, "secure": True, "sameSite": "None",
-                        })
-                    # Update browser cookies on conductor
-                    await self.context.add_cookies([{
-                        "name": "access_token", "value": new_token,
-                        "domain": "en.onlinesoccermanager.com", "path": "/",
-                        "httpOnly": False, "secure": True, "sameSite": "None",
-                    }])
+                    await self._replace_runtime_cookie("access_token", new_token)
+                    rotated_refresh = data.get("refresh_token")
+                    if rotated_refresh:
+                        await self._replace_runtime_cookie("refresh_token", rotated_refresh)
                     return new_token
                 else:
-                    self._log(f"Token refresh failed: {data}")
+                    self._log(f"Token refresh failed (HTTP {resp.status_code})")
                     return None
         except Exception as e:
             self._log(f"Token refresh error: {e}")
             return None
 
-    async def _api_get(self, endpoint: str) -> dict:
+    async def _api_request(
+        self,
+        method: str,
+        endpoint: str,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> tuple[int, Any]:
         import httpx
         # Prefer the live browser cookie (frontend keeps it fresh), then the
         # dump's token, then a client-credential refresh as last resort.
@@ -394,27 +446,54 @@ class OSMConductorBot:
         if not token:
             token = await self._refresh_access_token()
         if not token:
-            return {"error": "No token"}
+            return 0, {"error": "No token"}
         url = f"https://web-api.onlinesoccermanager.com{endpoint}"
         headers = {
             "Authorization": f"Bearer {token}",
-            "AppVersion": "3.248.3", "PlatformId": "13",
+            "AppVersion": "3.251.0", "PlatformId": "13",
             "Origin": "https://en.onlinesoccermanager.com",
             "Referer": "https://en.onlinesoccermanager.com/",
         }
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, headers=headers, timeout=10)
-            if resp.status_code in (401, 403):
-                # Token stale — re-read the live cookie (frontend may have just
-                # refreshed it) before falling back to a credential refresh.
-                token = await self._get_live_access_token() or await self._refresh_access_token()
-                if token:
-                    headers["Authorization"] = f"Bearer {token}"
-                    resp = await client.get(url, headers=headers, timeout=10)
-            try:
-                return resp.json()
-            except Exception:
-                return {"error": "Invalid JSON", "status": resp.status_code, "text": resp.text[:200]}
+        try:
+            async with httpx.AsyncClient() as client:
+                request_body = (
+                    {"data": payload}
+                    if payload is not None and endpoint.rstrip("/").endswith("/trainingsessions")
+                    else {"json": payload}
+                )
+                resp = await client.request(
+                    method.upper(), url, headers=headers, timeout=15, **request_body
+                )
+                if resp.status_code in (401, 403):
+                    # The frontend may have rotated the cookie since the first
+                    # read. If it did not, try the existing explicit refresh
+                    # fallback. Neither path logs or persists token values.
+                    live_token = await self._get_live_access_token()
+                    if not live_token or live_token == token:
+                        live_token = await self._refresh_access_token()
+                    if live_token:
+                        headers["Authorization"] = f"Bearer {live_token}"
+                        resp = await client.request(
+                            method.upper(), url, headers=headers, timeout=15, **request_body
+                        )
+                if not resp.content:
+                    data: Any = {}
+                else:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = {"error": "Invalid JSON"}
+                return resp.status_code, data
+        except httpx.HTTPError:
+            return 0, {"error": "Network request failed"}
+
+    async def _api_get(self, endpoint: str) -> dict:
+        status, data = await self._api_request("GET", endpoint)
+        if 200 <= status < 300 and isinstance(data, dict):
+            return data
+        if isinstance(data, dict) and data.get("error"):
+            return {"error": data["error"], "status": status}
+        return {"error": "API request failed", "status": status}
 
     # ------------------------------------------------------------------
     # Rate-limit detection (dual source)
@@ -996,7 +1075,32 @@ class OSMConductorBot:
             await self._inject_storage()
             await self._open_conductor()
             await self._start_mutation_observer()
-            await self._conductor_loop()
+            if self.auto_training:
+                if self.training_league_id and self.training_team_id:
+                    self.training_manager = AutoTrainingManager(
+                        api_request=self._api_request,
+                        league_id=self.training_league_id,
+                        team_id=self.training_team_id,
+                        log=self._log,
+                        normal_timer_id=self.normal_training_timer_id,
+                        universal_timer_id=self.universal_training_timer_id,
+                        poll_interval=self.training_poll_interval,
+                        should_stop=self._should_stop,
+                    )
+                    self._training_task = asyncio.create_task(
+                        self.training_manager.run(), name="osm-auto-training"
+                    )
+                else:
+                    self._log(
+                        "[TRAINING] disabled: league/team context was not found in "
+                        "the StorageDump or HAR profile"
+                    )
+            try:
+                await self._conductor_loop()
+            finally:
+                if self._training_task and not self._training_task.done():
+                    self._training_task.cancel()
+                    await asyncio.gather(self._training_task, return_exceptions=True)
 
     def print_summary(self):
         self._log("")
@@ -1007,6 +1111,16 @@ class OSMConductorBot:
         self._log("  Ads Watched       : {}".format(self.stats['watched']))
         self._log("  Errors            : {}".format(self.stats['errors']))
         self._log("  BossCoins Earned  : ~{}".format(self.stats['watched']))
+        if self.training_manager:
+            self._log("  Trainings Claimed : {}".format(
+                self.training_manager.stats["claimed"]
+            ))
+            self._log("  Trainings Started : {}".format(
+                self.training_manager.stats["started"]
+            ))
+            self._log("  Training Errors   : {}".format(
+                self.training_manager.stats["errors"]
+            ))
         self._log("  End Time          : {}".format(datetime.now().isoformat()))
         self._log("═══════════════════════════════════════════")
 
@@ -1017,7 +1131,7 @@ class OSMConductorBot:
 
 def main():
     parser = argparse.ArgumentParser(description="OSM Ad Watcher — Conductor Edition")
-    parser.add_argument("--dump", required=True, help="Path to StorageDump directory")
+    parser.add_argument("--dump", required=True, help="Path to StorageDump directory or ZIP")
     parser.add_argument("--headless", action="store_true", help="Run headless")
     parser.add_argument("--watcher-tabs", type=int, default=1,
                         help="Number of watcher tabs to open after cooldown (max 9)")
@@ -1025,6 +1139,16 @@ def main():
                         help="Seconds between conductor polls (default 30)")
     parser.add_argument("--ad-duration", type=int, default=30,
                         help="Seconds to wait for real ad to finish")
+    parser.add_argument("--auto-training", action="store_true",
+                        help="Claim completed trainings and fill empty trainer slots")
+    parser.add_argument("--training-poll-interval", type=int, default=60,
+                        help="Seconds between automatic training checks (default 60)")
+    parser.add_argument("--training-har-profile",
+                        help="HAR used only for timer IDs/context; never for credentials")
+    parser.add_argument("--normal-training-timer-id", type=int,
+                        help="Override normal trainer timer setting ID")
+    parser.add_argument("--universal-training-timer-id", type=int,
+                        help="Override universal trainer timer setting ID")
     parser.add_argument("--log", help="Log file path")
     args = parser.parse_args()
 
@@ -1035,6 +1159,11 @@ def main():
         poll_interval=args.poll_interval,
         ad_duration=args.ad_duration,
         log_file=args.log,
+        auto_training=args.auto_training,
+        training_poll_interval=args.training_poll_interval,
+        training_har_profile=args.training_har_profile,
+        normal_training_timer_id=args.normal_training_timer_id,
+        universal_training_timer_id=args.universal_training_timer_id,
     )
 
     signal.signal(signal.SIGINT, bot.shutdown)

@@ -1,6 +1,6 @@
 """Load and inject browser storage dumps into a Playwright context."""
 import json
-import urllib.parse
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -15,11 +15,46 @@ class StorageLoader:
         self._parse()
 
     def _parse(self):
-        cookies_path = self.dump_dir / "cookies.json"
+        archive = None
+        if self.dump_dir.is_file():
+            try:
+                archive = zipfile.ZipFile(self.dump_dir)
+            except zipfile.BadZipFile as exc:
+                raise ValueError("StorageDump is not a valid ZIP archive") from exc
+            names = set(archive.namelist())
 
-        if cookies_path.exists():
-            with open(cookies_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            def exists(name: str) -> bool:
+                return name in names
+
+            def read_json(name: str, max_bytes: int) -> Any:
+                info = archive.getinfo(name)
+                if info.file_size > max_bytes:
+                    raise ValueError(f"StorageDump member is unexpectedly large: {name}")
+                with archive.open(info) as fh:
+                    return json.load(fh)
+
+            def storage_parts(name: str) -> list[str]:
+                return [item for item in names if item.startswith(name + "/part-") and item.endswith(".json")]
+        elif self.dump_dir.is_dir():
+            def exists(name: str) -> bool:
+                return (self.dump_dir / name).exists()
+
+            def read_json(name: str, max_bytes: int) -> Any:
+                path = self.dump_dir / name
+                if path.stat().st_size > max_bytes:
+                    raise ValueError(f"StorageDump member is unexpectedly large: {name}")
+                with open(path, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+
+            def storage_parts(name: str) -> list[str]:
+                directory = self.dump_dir / name
+                return [str(path.relative_to(self.dump_dir)) for path in directory.glob("part-*.json")] if directory.is_dir() else []
+        else:
+            raise ValueError(f"StorageDump path not found: {self.dump_dir}")
+
+        try:
+            if exists("cookies.json"):
+                data = read_json("cookies.json", 5 * 1024 * 1024)
                 for item in data.get("data", []):
                     meta = item.get("metadata", {})
                     def normalize_same_site(val):
@@ -47,43 +82,43 @@ class StorageLoader:
                         cookie.pop("expires", None)
                     self.cookies.append(cookie)
 
-        def parse_storage(name: str):
-            # Supports two StorageDump layouts:
-            #   - old:  <name>.json           -> {"data": [ {key, metadata, value}, ... ]}
-            #   - new:  <name>/part-*.json    -> each file is a list (or {"data": [...]})
-            items = []
-            raw_entries = []
+            def parse_storage(name: str):
+                # Supports two StorageDump layouts:
+                #   - old:  <name>.json           -> {"data": [ ... ]}
+                #   - new:  <name>/part-*.json    -> list or {"data": [...]}
+                items = []
+                raw_entries = []
 
-            single = self.dump_dir / f"{name}.json"
-            multi_dir = self.dump_dir / name
-
-            if single.exists():
-                with open(single, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                raw_entries.extend(data.get("data", []) if isinstance(data, dict) else data)
-            elif multi_dir.is_dir():
-                def _part_key(p: Path):
-                    digits = "".join(ch for ch in p.stem if ch.isdigit())
-                    return int(digits) if digits else 0
-                for part in sorted(multi_dir.glob("part-*.json"), key=_part_key):
-                    with open(part, "r", encoding="utf-8") as f:
-                        data = json.load(f)
+                single = f"{name}.json"
+                parts = storage_parts(name)
+                if exists(single):
+                    data = read_json(single, 20 * 1024 * 1024)
                     raw_entries.extend(data.get("data", []) if isinstance(data, dict) else data)
+                elif parts:
+                    def _part_key(member: str):
+                        digits = "".join(ch for ch in Path(member).stem if ch.isdigit())
+                        return int(digits) if digits else 0
+                    for part in sorted(parts, key=_part_key):
+                        data = read_json(part, 10 * 1024 * 1024)
+                        raw_entries.extend(data.get("data", []) if isinstance(data, dict) else data)
 
-            for item in raw_entries:
-                meta = item.get("metadata", {}) or {}
-                origin = meta.get("origin", "https://en.onlinesoccermanager.com")
-                key = item["key"]
-                value = item["value"]
-                if isinstance(value, (dict, list)):
-                    value = json.dumps(value)
-                else:
-                    value = str(value)
-                items.append({"origin": origin, "key": key, "value": value})
-            return items
+                for item in raw_entries:
+                    meta = item.get("metadata", {}) or {}
+                    origin = meta.get("origin", "https://en.onlinesoccermanager.com")
+                    key = item["key"]
+                    value = item["value"]
+                    if isinstance(value, (dict, list)):
+                        value = json.dumps(value)
+                    else:
+                        value = str(value)
+                    items.append({"origin": origin, "key": key, "value": value})
+                return items
 
-        self.local_storage = parse_storage("local")
-        self.session_storage = parse_storage("session")
+            self.local_storage = parse_storage("local")
+            self.session_storage = parse_storage("session")
+        finally:
+            if archive is not None:
+                archive.close()
 
     async def inject(self, context):
         """Inject cookies and storage into a Playwright BrowserContext."""
