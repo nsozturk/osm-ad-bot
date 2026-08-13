@@ -5,7 +5,7 @@
 
 ## Summary
 
-The live balance is 8,322,884. Although four meaningful upgrades technically fit, all offer only +1 or +2 OVR; spending now would delay much stronger near-budget targets. The best decision is to wait approximately 1.50M for Aina, a +12 OVR defensive upgrade, rather than buy Grull for +2 OVR.
+The refreshed live balance is 21,353,998. For a 4-3-3, the best immediate use of that cash is the Aina + Tobias defensive package: it costs 16,409,265, raises the starting XI by a combined +19 OVR, and leaves 4,944,733. Yildiz is the best single-player purchase at +17 OVR, but costs 20,558,247 and leaves only 795,751.
 
 ## Findings
 
@@ -17,30 +17,32 @@ The live balance is 8,322,884. Although four meaningful upgrades technically fit
 
 ### Current snapshot
 
-- Cash: 8,322,884; savings: 0.
-- Squad: 29 players; transfer market: 86 entries, of which 82 are external players and 4 are the user's listed players.
-- Starting-XI thresholds in 4-3-3: GK 39, DEF 47, MID 76, ATT 45.
-- Four listed squad players total 14,577,859 in asking prices. These proceeds are not counted until sales complete.
+- Cash: 21,353,998; savings: 0.
+- Squad: 26 players; transfer market: 91 entries, of which 89 are external players and 2 are the user's listed players.
+- Current 4-3-3 starting XI: ATT 47/46/46, MID 82/80/79, DEF 56/53/47/47, GK 41.
+- Starting-XI marginal thresholds: GK 41, DEF 47, MID 79, ATT 46.
+- Listed players: Burke for 12,137,142 and J. Friedrich for 3,062,745. These proceeds are not counted until sales complete.
 
-### Affordable meaningful upgrades
+### Best affordable options
 
-- Grull, ATT OVR 47, age 28, price 6,204,739: +2 OVR.
-- R. Kristensen, DEF OVR 49, age 29, price 7,671,402: +2 OVR.
-- Ramsdale, GK OVR 40, age 28, price 7,969,310: +1 OVR.
-- Tsimikas, DEF OVR 48, age 30, price 7,561,003: +1 OVR.
+- Aina, DEF OVR 59, age 29, price 9,691,128: +12 OVR to the XI.
+- Tobias, DEF OVR 54, age 22, price 6,718,137: +7 OVR to the XI.
+- Yildiz, ATT OVR 63, age 21, price 20,558,247: +17 OVR to the XI.
+- Rayan, ATT OVR 56, age 20, price 19,060,051: +10 OVR to the XI.
+- Hakimi, DEF OVR 60, age 27, price 20,708,136: +13 OVR to the XI.
 
-None is recommended because each consumes most of the cash for a marginal improvement.
+An exhaustive search over affordable one-to-four-player combinations found Aina + Tobias to be the maximum immediate 4-3-3 starting-XI gain within the current cash balance. Their combined +19 gain comes from replacing both OVR 47 starting defenders.
 
 ### Recommended targets
 
-1. Wait for Aina, DEF OVR 59, age 29, price 9,821,647. Only 1,498,763 more is needed and the defensive starting-XI threshold improves by +12 OVR.
-2. If an attacker is the priority, Y. Hernandez, ATT OVR 51, age 23, costs 12,012,113 and gives +6 OVR; 3,689,229 more is needed.
-3. Jovanovic, ATT OVR 49, age 19, costs 11,504,292 and gives +4 OVR; he is younger but has less immediate impact than Y. Hernandez.
-4. Do not spend an extra 28K on Suzuki merely because he is nearly affordable: he gives only +1 OVR.
+1. Best squad-strengthening package now: buy Aina + Tobias for 16,409,265. The XI gains +19 OVR and 4,944,733 remains.
+2. Best single-player/star option now: buy Yildiz for 20,558,247. The attack gains +17 OVR, but only 795,751 remains.
+3. If Burke sells first, the cash would rise to 33,491,140. At that point Yildiz + Aina costs 30,249,375, gives +29 OVR to the XI, and leaves 3,241,765.
+4. If both listed players sell, the cash would rise to 36,553,885. At that point Gakpo + Aina costs 35,345,443, gives +32 OVR, and leaves 1,208,442.
 
 ### Decision
 
-Buy nobody now. Aina provides six times Grull's XI improvement for about 1.58 times the price and is only 1.50M away. If one of the four listed players sells, re-check the live market immediately because the cash threshold for Aina will likely be crossed.
+For the current squad, Aina + Tobias is the rational purchase because it produces the largest immediate XI improvement under budget without exhausting the treasury. Choose Yildiz instead only if prioritizing a young attacking star over total team improvement. Re-check the live market before executing because listings and prices can change.
 
 ## Sources
 
