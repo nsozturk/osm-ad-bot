@@ -15,6 +15,8 @@ The running conductor remains on the existing selection behavior until a control
 
 `run.sh` continues to start one process containing both the ad conductor and automatic training manager. A training-selection failure must remain isolated from the ad loop.
 
+While automatic training is enabled, the conductor page remains on the OSM origin during ad cooldowns instead of parking on `about:blank`. This lets the frontend keep rotating the short-lived access-token cookie required by the training API; without automatic training, the existing low-CPU parking behavior remains unchanged.
+
 ## Eligibility Rules
 
 The existing exclusions remain mandatory:

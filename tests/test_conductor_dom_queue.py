@@ -10,6 +10,7 @@ class FakePage:
         self.read_results = list(read_results or [])
         self.install_result = install_result
         self.scripts = []
+        self.goto_calls = []
 
     def is_closed(self):
         return self.closed
@@ -25,6 +26,10 @@ class FakePage:
             raise self.install_result
         return self.install_result
 
+    async def goto(self, url):
+        self.goto_calls.append(url)
+        self.url = url
+
 
 def make_bot(page):
     bot = object.__new__(OSMConductorBot)
@@ -34,10 +39,30 @@ def make_bot(page):
     bot._log = bot.logs.append
     bot._dom_check_warning_active = False
     bot._dom_observer_warning_active = False
+    bot.auto_training = False
     return bot
 
 
 class ConductorDomQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_park_keeps_osm_page_awake_for_automatic_training(self):
+        page = FakePage()
+        bot = make_bot(page)
+        bot.auto_training = True
+
+        await bot._park_conductor()
+
+        self.assertEqual(page.goto_calls, [])
+        self.assertTrue(page.url.startswith("https://en.onlinesoccermanager.com"))
+
+    async def test_park_uses_blank_page_without_automatic_training(self):
+        page = FakePage()
+        bot = make_bot(page)
+
+        await bot._park_conductor()
+
+        self.assertEqual(page.goto_calls, ["about:blank"])
+        self.assertEqual(page.url, "about:blank")
+
     async def test_missing_queue_reinstalls_observer_without_crashing(self):
         page = FakePage([{"ready": False, "value": None}])
         bot = make_bot(page)

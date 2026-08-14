@@ -170,10 +170,15 @@ class OSMConductorBot:
 
     async def _park_conductor(self):
         """During long idle waits, navigate the conductor to about:blank so the
-        OSM SPA stops running its render loop / ad refreshes / timers. Drops the
-        single idle tab from steady CPU to ~0 while we just sleep."""
+        OSM SPA stops running its render loop / ad refreshes / timers.
+
+        Automatic training keeps this page awake because the OSM frontend
+        rotates the short-lived access-token cookie used by training API calls.
+        """
         try:
             page = self.conductor_page
+            if self.auto_training:
+                return
             if page and not page.is_closed() and page.url != "about:blank":
                 await page.goto("about:blank")
                 self._log("[CONDUCTOR] parked (about:blank) — idle, no CPU")
