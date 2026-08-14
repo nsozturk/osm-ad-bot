@@ -14,8 +14,8 @@
 - [x] Add focused tests for low-level youth, goalkeeper floor, age preference, veteran override/fallback, top-band behavior, and diagnostics.
 - [x] Run the full unit suite, Python compilation, shell syntax checks, diff checks, and credential/path scans.
 - [x] Keep the OSM conductor page awake while automatic training is enabled so its short-lived API token continues rotating during ad cooldowns.
-- [ ] Commit only the plan, implementation, and tests; preserve unrelated staged work.
-- [ ] Restart the live one-process bot and verify both ad watching and age-aware training from runtime logs.
+- [x] Commit only the plan, implementation, and tests; preserve unrelated staged work.
+- [x] Restart the live one-process bot and verify both ad watching and age-aware training from runtime logs.
 
 ## Step 1: Candidate Model and Policy Helpers
 

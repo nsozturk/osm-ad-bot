@@ -64,8 +64,11 @@ With `--auto-training`, the conductor runs a separate, failure-isolated training
 - Claims completed training sessions before refilling slots.
 - Fills attacker, midfielder, defender, and goalkeeper trainers with matching players.
 - Uses `forecast` for normal trainers and `forecastUniversal` for the universal trainer.
-- Randomly selects from up to five players within 85% of the best current forecast, weighted toward the higher forecast. A player whose yield drops after repeated training naturally loses priority.
+- Scores candidates as `forecast × age multiplier`: `1.25` through age 21, `1.15` for 22–24, `1.00` for 25–28, `0.80` for 29–31, and `0.60` from age 32 onward.
+- Randomly selects from up to five players within 90% of the best current priority score, weighted toward the higher score. A player whose yield drops after repeated training naturally loses priority.
+- Excludes outfield players below main stat 50 and goalkeepers below 40, even when they are very young; these floors are never relaxed as a fallback.
 - Excludes injured players, players already training, max-level players, and players listed for transfer.
+- Keeps the OSM conductor page awake during ad cooldowns so the frontend continues rotating the short-lived token required by automatic training.
 - Never buys a universal trainer, boosts a timer, converts Boss Coins, buys a player, or changes a transfer listing.
 
 The optional Training HAR is a non-secret settings profile. Chrome HAR exports omit usable Authorization and cookie values, so a HAR cannot replace a fresh post-login StorageDump.
