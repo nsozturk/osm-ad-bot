@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 from auto_training import (
     AutoTrainingManager,
     build_candidate_pool,
+    build_candidate_pool_result,
     choose_candidate,
     load_training_profile,
     session_finished,
@@ -72,8 +73,8 @@ class AutoTrainingSelectionTests(unittest.TestCase):
         ]
         forecasts = [
             {"playerId": 1, "forecast": 100},
-            {"playerId": 2, "forecast": 85},
-            {"playerId": 3, "forecast": 84},
+            {"playerId": 2, "forecast": 92},
+            {"playerId": 3, "forecast": 89},
             {"playerId": 4, "forecast": 100},
             {"playerId": 5, "forecast": 100},
             {"playerId": 6, "forecast": 100},
@@ -81,9 +82,104 @@ class AutoTrainingSelectionTests(unittest.TestCase):
         pool = build_candidate_pool(players, forecasts, 1, {6}, {5})
         self.assertEqual([item.player["id"] for item in pool], [1, 2])
 
+    def test_very_young_outfield_player_below_floor_is_excluded(self):
+        players = [
+            {"id": 1, "position": 1, "age": 16, "statAtt": 49},
+            {"id": 2, "position": 1, "age": 23, "statAtt": 55},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 100},
+            {"playerId": 2, "forecast": 60},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 1, set(), set())
+
+        self.assertEqual([item.player["id"] for item in pool], [2])
+
+    def test_goalkeeper_below_floor_is_excluded_and_veteran_can_be_fallback(self):
+        players = [
+            {"id": 1, "position": 4, "age": 18, "statDef": 39},
+            {"id": 2, "position": 4, "age": 34, "statDef": 40},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 100},
+            {"playerId": 2, "forecast": 60},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 4, set(), set())
+        chosen = choose_candidate(pool, random.Random(1))
+
+        self.assertEqual([item.player["id"] for item in pool], [2])
+        self.assertEqual(chosen.player["id"], 2)
+
+    def test_young_average_player_outranks_veteran_at_equal_forecast(self):
+        players = [
+            {"id": 1, "position": 3, "age": 23, "statDef": 55},
+            {"id": 2, "position": 3, "age": 30, "statDef": 70},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 80},
+            {"playerId": 2, "forecast": 80},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 3, set(), set())
+
+        self.assertEqual([item.player["id"] for item in pool], [1])
+        self.assertEqual(pool[0].priority_score, 92.0)
+
+    def test_veteran_can_win_with_large_forecast_advantage(self):
+        players = [
+            {"id": 1, "position": 2, "age": 21, "statOvr": 55},
+            {"id": 2, "position": 2, "age": 33, "statOvr": 70},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 40},
+            {"playerId": 2, "forecast": 100},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 2, set(), set())
+
+        self.assertEqual([item.player["id"] for item in pool], [2])
+        self.assertEqual(pool[0].priority_score, 60.0)
+
+    def test_below_floor_players_never_form_a_fallback_pool(self):
+        players = [
+            {"id": 1, "position": 1, "age": 18, "statAtt": 49},
+            {"id": 2, "position": 1, "age": 19, "statAtt": 30},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 100},
+            {"playerId": 2, "forecast": 100},
+        ]
+
+        result = build_candidate_pool_result(players, forecasts, 1, set(), set())
+
+        self.assertEqual(result.candidates, [])
+        self.assertEqual(
+            result.empty_reason,
+            "all available candidates are below the minimum main stat",
+        )
+
+    def test_empty_pool_reasons_distinguish_forecast_and_unavailable_players(self):
+        player = {"id": 1, "position": 1, "age": 21, "statAtt": 60}
+
+        no_forecast = build_candidate_pool_result([player], [], 1, set(), set())
+        unavailable = build_candidate_pool_result(
+            [player], [{"playerId": 1, "forecast": 100}], 1, {1}, set()
+        )
+
+        self.assertEqual(
+            no_forecast.empty_reason,
+            "no positive forecast candidate above the minimum main stat",
+        )
+        self.assertEqual(
+            unavailable.empty_reason,
+            "all position candidates are occupied, injured, listed, or maxed",
+        )
+
     def test_weighted_choice_stays_inside_top_band(self):
         players = [
-            {"id": i, "position": 2, "age": 20 + i, "statOvr": 50}
+            {"id": i, "position": 2, "age": 25, "statOvr": 50}
             for i in range(1, 8)
         ]
         forecasts = [
@@ -92,8 +188,11 @@ class AutoTrainingSelectionTests(unittest.TestCase):
         ]
         pool = build_candidate_pool(players, forecasts, 2, set(), set())
         self.assertLessEqual(len(pool), 5)
-        chosen = choose_candidate(pool, random.Random(7))
-        self.assertIn(chosen, pool)
+        first = choose_candidate(pool, random.Random(7))
+        second = choose_candidate(pool, random.Random(7))
+        self.assertIn(first, pool)
+        self.assertEqual(first.player["id"], second.player["id"])
+        self.assertTrue(all(item.priority_score >= pool[0].priority_score * 0.90 for item in pool))
 
     def test_finished_session_uses_server_timestamp(self):
         session = {
@@ -202,7 +301,32 @@ class AutoTrainingManagerTests(unittest.IsolatedAsyncioTestCase):
         player_ids = [session["playerId"] for session in api.sessions]
         self.assertEqual(len(player_ids), len(set(player_ids)))
         self.assertTrue(any("claimed completed session" in line for line in logs))
+        self.assertTrue(any(
+            "stat " in line and "age " in line and "forecast " in line and "priority " in line
+            for line in logs
+        ))
         self.assertFalse(any("universaltrainer/buy" in endpoint for _, endpoint, _ in api.requests))
+
+    async def test_candidate_ranking_failure_skips_only_affected_trainer(self):
+        api = FakeTrainingApi()
+        logs = []
+        manager = AutoTrainingManager(
+            api, "123", "4", logs.append, poll_interval=15, rng=random.Random(1)
+        )
+        original = build_candidate_pool_result
+
+        def fail_attacker_only(players, forecasts, trainer, occupied, listed):
+            if trainer == 1:
+                raise ValueError("bad player state")
+            return original(players, forecasts, trainer, occupied, listed)
+
+        with patch("auto_training.build_candidate_pool_result", side_effect=fail_attacker_only):
+            await manager.reconcile()
+
+        trainers = sorted(session["trainer"] for session in api.sessions)
+        self.assertEqual(trainers, [2, 3, 4, 5])
+        self.assertEqual(manager.stats["errors"], 1)
+        self.assertTrue(any("trainer 1 candidate ranking failed" in line for line in logs))
 
     async def test_empty_ongoing_404_is_normalized_to_empty_list(self):
         async def api(method, endpoint, payload=None):

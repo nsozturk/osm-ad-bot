@@ -22,6 +22,10 @@ NORMAL_TRAINING_TIMER_ID = 746
 UNIVERSAL_TRAINING_TIMER_ID = 982
 MAX_PLAYER_MAIN_STAT = 200
 UNIVERSAL_ENTITLEMENT_TIMER_TYPE = 16
+MIN_OUTFIELD_MAIN_STAT = 50
+MIN_GOALKEEPER_MAIN_STAT = 40
+PRIORITY_POOL_RATIO = 0.90
+PRIORITY_POOL_LIMIT = 5
 
 TRAINERS = {
     1: ("attacker", 1, "forecast"),
@@ -44,6 +48,16 @@ class TrainingProfile:
 class Candidate:
     player: dict[str, Any]
     forecast: int
+    main_stat: int
+    age: int
+    age_multiplier: float
+    priority_score: float
+
+
+@dataclass(frozen=True)
+class CandidatePoolResult:
+    candidates: list[Candidate]
+    empty_reason: str = ""
 
 
 class TrainingApiError(RuntimeError):
@@ -175,6 +189,26 @@ def player_main_stat(player: dict[str, Any]) -> int:
     return _safe_int(player.get("statDef"))
 
 
+def minimum_main_stat(player: dict[str, Any]) -> int:
+    if _safe_int(player.get("position")) == 4:
+        return MIN_GOALKEEPER_MAIN_STAT
+    return MIN_OUTFIELD_MAIN_STAT
+
+
+def training_age_multiplier(age: int) -> float:
+    if age <= 0:
+        return 0.60
+    if age <= 21:
+        return 1.25
+    if age <= 24:
+        return 1.15
+    if age <= 28:
+        return 1.00
+    if age <= 31:
+        return 0.80
+    return 0.60
+
+
 def listed_player_ids(transfers: list[dict[str, Any]], squad_ids: set[int]) -> set[int]:
     result: set[int] = set()
     for entry in transfers:
@@ -185,6 +219,83 @@ def listed_player_ids(transfers: list[dict[str, Any]], squad_ids: set[int]) -> s
     return result
 
 
+def build_candidate_pool_result(
+    players: list[dict[str, Any]],
+    forecasts: list[dict[str, Any]],
+    trainer: int,
+    occupied_player_ids: set[int],
+    transfer_listed_ids: set[int],
+) -> CandidatePoolResult:
+    role = TRAINERS.get(trainer)
+    if not role:
+        return CandidatePoolResult([], "unknown trainer")
+    _, required_position, forecast_field = role
+    forecast_by_id = {
+        _safe_int(item.get("playerId")): _safe_int(item.get(forecast_field))
+        for item in forecasts
+    }
+    matching_players = [
+        player for player in players
+        if required_position is None or _safe_int(player.get("position")) == required_position
+    ]
+    available_players: list[tuple[dict[str, Any], int, int]] = []
+    for player in matching_players:
+        player_id = _safe_int(player.get("id"))
+        main_stat = player_main_stat(player)
+        if not player_id or player_id in occupied_player_ids or player_id in transfer_listed_ids:
+            continue
+        if _safe_int(player.get("injuryId")) > 0 or main_stat >= MAX_PLAYER_MAIN_STAT:
+            continue
+        available_players.append((player, player_id, main_stat))
+
+    if not available_players:
+        return CandidatePoolResult(
+            [], "all position candidates are occupied, injured, listed, or maxed"
+        )
+
+    above_floor = [
+        (player, player_id, main_stat)
+        for player, player_id, main_stat in available_players
+        if main_stat >= minimum_main_stat(player)
+    ]
+    if not above_floor:
+        return CandidatePoolResult([], "all available candidates are below the minimum main stat")
+
+    candidates: list[Candidate] = []
+    for player, player_id, main_stat in above_floor:
+        forecast = forecast_by_id.get(player_id, 0)
+        if forecast <= 0:
+            continue
+        age = _safe_int(player.get("age"), 99)
+        age_multiplier = training_age_multiplier(age)
+        candidates.append(Candidate(
+            player=player,
+            forecast=forecast,
+            main_stat=main_stat,
+            age=age,
+            age_multiplier=age_multiplier,
+            priority_score=forecast * age_multiplier,
+        ))
+
+    candidates.sort(
+        key=lambda item: (
+            -item.priority_score,
+            -item.forecast,
+            item.age,
+            -item.main_stat,
+            _safe_int(item.player.get("id")),
+        )
+    )
+    if not candidates:
+        return CandidatePoolResult([], "no positive forecast candidate above the minimum main stat")
+    best_score = candidates[0].priority_score
+    pool = [
+        item for item in candidates
+        if item.priority_score >= best_score * PRIORITY_POOL_RATIO
+    ][:PRIORITY_POOL_LIMIT]
+    return CandidatePoolResult(pool)
+
+
 def build_candidate_pool(
     players: list[dict[str, Any]],
     forecasts: list[dict[str, Any]],
@@ -192,50 +303,21 @@ def build_candidate_pool(
     occupied_player_ids: set[int],
     transfer_listed_ids: set[int],
 ) -> list[Candidate]:
-    role = TRAINERS.get(trainer)
-    if not role:
-        return []
-    _, required_position, forecast_field = role
-    forecast_by_id = {
-        _safe_int(item.get("playerId")): _safe_int(item.get(forecast_field))
-        for item in forecasts
-    }
-    candidates: list[Candidate] = []
-    for player in players:
-        player_id = _safe_int(player.get("id"))
-        if not player_id or player_id in occupied_player_ids or player_id in transfer_listed_ids:
-            continue
-        if required_position is not None and _safe_int(player.get("position")) != required_position:
-            continue
-        if _safe_int(player.get("injuryId")) > 0:
-            continue
-        if player_main_stat(player) >= MAX_PLAYER_MAIN_STAT:
-            continue
-        forecast = forecast_by_id.get(player_id, 0)
-        if forecast <= 0:
-            continue
-        candidates.append(Candidate(player=player, forecast=forecast))
-
-    candidates.sort(
-        key=lambda item: (
-            -item.forecast,
-            _safe_int(item.player.get("age"), 99),
-            -int(_safe_int(item.player.get("lineup")) > 0),
-            -player_main_stat(item.player),
-            _safe_int(item.player.get("id")),
-        )
-    )
-    if not candidates:
-        return []
-    best = candidates[0].forecast
-    return [item for item in candidates if item.forecast >= best * 0.85][:5]
+    """Return the ranked candidate pool while preserving the public helper API."""
+    return build_candidate_pool_result(
+        players,
+        forecasts,
+        trainer,
+        occupied_player_ids,
+        transfer_listed_ids,
+    ).candidates
 
 
 def choose_candidate(pool: list[Candidate], rng: Optional[random.Random] = None) -> Optional[Candidate]:
     if not pool:
         return None
     rng = rng or random.SystemRandom()
-    weights = [item.forecast ** 2 for item in pool]
+    weights = [item.priority_score ** 2 for item in pool]
     cursor = rng.random() * sum(weights)
     for item, weight in zip(pool, weights):
         cursor -= weight
@@ -333,7 +415,9 @@ class AutoTrainingManager:
             self.stats["started"] += 1
             self.log(
                 f"[TRAINING] trainer {trainer} started {name} "
-                f"(player {payload['playerId']}, forecast {candidate.forecast})"
+                f"(player {payload['playerId']}, stat {candidate.main_stat}, "
+                f"age {candidate.age}, forecast {candidate.forecast}, "
+                f"priority {candidate.priority_score:.1f})"
             )
             return True, status
         self.log(
@@ -341,6 +425,31 @@ class AutoTrainingManager:
             f"start rejected (HTTP {status or 'network'})"
         )
         return False, status
+
+    def _select_candidate(
+        self,
+        trainer: int,
+        players: list[dict[str, Any]],
+        forecasts: list[dict[str, Any]],
+        occupied_player_ids: set[int],
+        transfer_listed_ids: set[int],
+    ) -> Optional[Candidate]:
+        try:
+            result = build_candidate_pool_result(
+                players,
+                forecasts,
+                trainer,
+                occupied_player_ids,
+                transfer_listed_ids,
+            )
+            if not result.candidates:
+                self.log(f"[TRAINING] trainer {trainer} empty: {result.empty_reason}")
+                return None
+            return choose_candidate(result.candidates, self.rng)
+        except Exception:
+            self.stats["errors"] += 1
+            self.log(f"[TRAINING] trainer {trainer} candidate ranking failed; skipping this pass")
+            return None
 
     @staticmethod
     def _timer_signature(timers: list[dict[str, Any]]) -> tuple[Any, ...]:
@@ -385,10 +494,10 @@ class AutoTrainingManager:
             for trainer in (1, 2, 3, 4):
                 if trainer in occupied_trainers:
                     continue
-                pool = build_candidate_pool(players, forecasts, trainer, occupied_players, listed_ids)
-                candidate = choose_candidate(pool, self.rng)
-                if not candidate:
-                    self.log(f"[TRAINING] trainer {trainer} empty: no eligible forecast candidate")
+                candidate = self._select_candidate(
+                    trainer, players, forecasts, occupied_players, listed_ids
+                )
+                if candidate is None:
                     continue
                 started, _ = await self._start(trainer, candidate)
                 if started:
@@ -403,8 +512,9 @@ class AutoTrainingManager:
             if 5 not in occupied_trainers and (
                 has_universal_entitlement(timers) or not self._universal_probe_failed
             ):
-                pool = build_candidate_pool(players, forecasts, 5, occupied_players, listed_ids)
-                candidate = choose_candidate(pool, self.rng)
+                candidate = self._select_candidate(
+                    5, players, forecasts, occupied_players, listed_ids
+                )
                 if candidate:
                     started, status = await self._start(5, candidate)
                     if not started and status in (400, 402, 403, 404, 409, 422):
