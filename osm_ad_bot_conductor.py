@@ -12,12 +12,14 @@ import argparse
 import asyncio
 import base64
 import json
+import os
 import re
 import signal
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 from playwright.async_api import async_playwright, BrowserContext, Page
@@ -31,6 +33,13 @@ from storage_loader import StorageLoader
 
 OSM_ORIGIN = "https://en.onlinesoccermanager.com"
 OSM_TRAINING = f"{OSM_ORIGIN}/Training"
+OSM_API_ORIGIN = "https://web-api.onlinesoccermanager.com"
+# Public web client identifier used by the OSM frontend's tokenRefresh flow.
+# It is not an account credential; the refresh token remains in the dump.
+OSM_CLIENT_ID = "jPs3vVbg4uYnxGoyunSiNf1nIqUJmSFnpqJSVgWrJleu6Ak7Ga"
+CLIENT_SECRET_CACHE = (
+    Path(__file__).resolve().parent / "transfer-advisor" / "data" / ".client_secret"
+)
 
 SELECTORS = {
     "wallet_container": ".wallet-container.bosscoin-wallet",
@@ -42,6 +51,23 @@ DOM_COOLDOWN_RE = re.compile(
     r"Come\s+back\s+in\s+(\d+)\s+minute",
     re.IGNORECASE,
 )
+
+
+def _jwt_expiry(token: str) -> int:
+    """Read a JWT ``exp`` claim locally without logging or validating secrets."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return int(claims.get("exp", 0))
+    except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return 0
+
+
+def _token_expiring(token: str, skew_seconds: int = 60) -> bool:
+    """Return true when a token is expired or close enough to expiry to race."""
+    expiry = _jwt_expiry(token)
+    return bool(expiry and expiry <= int(time.time()) + max(0, skew_seconds))
 
 
 @dataclass
@@ -87,6 +113,11 @@ class OSMConductorBot:
         )
         self.training_manager: Optional[AutoTrainingManager] = None
         self._training_task: Optional[asyncio.Task] = None
+        # Training and rate-limit checks can hit the API at the same time.
+        # Serialize refresh-token rotation so only one request consumes the
+        # current refresh token and updates the browser cookies.
+        self._token_refresh_lock: Optional[asyncio.Lock] = None
+        self._token_refresh_warning_active = False
         # Account id derived from the loaded dump's token — never hardcoded.
         self.user_id = self._extract_user_id()
         self.stats = {"watched": 0, "errors": 0, "cycles": 0}
@@ -385,53 +416,80 @@ class OSMConductorBot:
             pass
         return None
 
-    async def _refresh_access_token(self) -> Optional[str]:
+    @staticmethod
+    def _cached_client_secret() -> str:
+        """Read the existing ignored refresh secret without ever logging it."""
+        value = os.environ.get("OSM_CLIENT_SECRET", "").strip()
+        if value:
+            return value
+        try:
+            return CLIENT_SECRET_CACHE.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    async def _refresh_access_token(self, force: bool = False) -> Optional[str]:
         import httpx
-        import os
+
+        observed_access = await self._get_live_access_token()
         refresh = await self._get_live_refresh_token()
         if not refresh:
             return None
-        client_id = os.environ.get("OSM_CLIENT_ID", "")
-        client_secret = os.environ.get("OSM_CLIENT_SECRET", "")
+        client_id = os.environ.get("OSM_CLIENT_ID", "").strip() or OSM_CLIENT_ID
+        client_secret = self._cached_client_secret()
         if not client_id or not client_secret:
-            if not getattr(self, "_warned_no_creds", False):
+            if not self._token_refresh_warning_active:
                 self._log("! OSM_CLIENT_ID / OSM_CLIENT_SECRET not set — API rate-limit "
                           "check disabled, falling back to DOM detection (this is fine)")
-                self._warned_no_creds = True
+                self._token_refresh_warning_active = True
             return None
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    "https://web-api.onlinesoccermanager.com/api/tokenRefresh",
-                    data={
-                        "grant_type": "refresh_token",
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "refresh_token": refresh,
-                    },
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "AppVersion": "3.251.0",
-                        "PlatformId": "13",
-                        "Origin": "https://en.onlinesoccermanager.com",
-                        "Referer": "https://en.onlinesoccermanager.com/",
-                    },
-                    timeout=10,
-                )
-                data = resp.json()
-                new_token = data.get("access_token")
-                if new_token:
-                    await self._replace_runtime_cookie("access_token", new_token)
-                    rotated_refresh = data.get("refresh_token")
-                    if rotated_refresh:
-                        await self._replace_runtime_cookie("refresh_token", rotated_refresh)
-                    return new_token
-                else:
+
+        if self._token_refresh_lock is None:
+            self._token_refresh_lock = asyncio.Lock()
+        async with self._token_refresh_lock:
+            # Another concurrent API call may already have rotated the token
+            # while this call was waiting for the lock.
+            current = await self._get_live_access_token()
+            if current and not _token_expiring(current) and (
+                not force or current != observed_access
+            ):
+                return current
+            refresh = await self._get_live_refresh_token()
+            if not refresh:
+                return None
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        f"{OSM_API_ORIGIN}/api/tokenRefresh",
+                        data={
+                            "grant_type": "refresh_token",
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "refresh_token": refresh,
+                        },
+                        headers={
+                            "Accept": "application/json; charset=utf-8",
+                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                            "AppVersion": "3.251.0",
+                            "PlatformId": "13",
+                            "Origin": OSM_ORIGIN,
+                            "Referer": f"{OSM_ORIGIN}/",
+                        },
+                        timeout=10,
+                    )
+                    data = resp.json()
+                    new_token = data.get("access_token")
+                    if new_token:
+                        await self._replace_runtime_cookie("access_token", new_token)
+                        rotated_refresh = data.get("refresh_token")
+                        if rotated_refresh:
+                            await self._replace_runtime_cookie("refresh_token", rotated_refresh)
+                        self._token_refresh_warning_active = False
+                        return new_token
                     self._log(f"Token refresh failed (HTTP {resp.status_code})")
                     return None
-        except Exception as e:
-            self._log(f"Token refresh error: {e}")
-            return None
+            except Exception as e:
+                self._log(f"Token refresh error: {e}")
+                return None
 
     async def _api_request(
         self,
@@ -440,32 +498,43 @@ class OSMConductorBot:
         payload: Optional[dict[str, Any]] = None,
     ) -> tuple[int, Any]:
         import httpx
-        # Prefer the live browser cookie (frontend keeps it fresh), then the
-        # dump's token, then a client-credential refresh as last resort.
+        # Prefer the live browser cookie, but do not send an expired short-lived
+        # token. The refresh token is rotated in the browser context and kept
+        # only in memory.
         token = await self._get_live_access_token()
+        if token and _token_expiring(token):
+            token = await self._refresh_access_token() or token
         if not token:
             for c in self.storage.cookies:
                 if c["name"] == "access_token":
                     token = c["value"]
                     break
+        if token and _token_expiring(token):
+            token = await self._refresh_access_token() or token
         if not token:
-            token = await self._refresh_access_token()
+            token = await self._refresh_access_token(force=True)
         if not token:
             return 0, {"error": "No token"}
-        url = f"https://web-api.onlinesoccermanager.com{endpoint}"
+        url = f"{OSM_API_ORIGIN}{endpoint}"
         headers = {
             "Authorization": f"Bearer {token}",
+            "Accept": "application/json; charset=utf-8",
+            "Content-Type": "application/json; charset=utf-8",
             "AppVersion": "3.251.0", "PlatformId": "13",
-            "Origin": "https://en.onlinesoccermanager.com",
-            "Referer": "https://en.onlinesoccermanager.com/",
+            "Origin": OSM_ORIGIN,
+            "Referer": f"{OSM_ORIGIN}/",
         }
         try:
             async with httpx.AsyncClient() as client:
-                request_body = (
-                    {"data": payload}
-                    if payload is not None and endpoint.rstrip("/").endswith("/trainingsessions")
-                    else {"json": payload}
-                )
+                if payload is None:
+                    request_body = {}
+                elif endpoint.rstrip("/").endswith("/trainingsessions"):
+                    # The live Training page submits application/x-www-form-urlencoded
+                    # fields (confirmed by the supplied HAR), not a JSON wrapper.
+                    request_body = {"data": payload}
+                    headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+                else:
+                    request_body = {"json": payload}
                 resp = await client.request(
                     method.upper(), url, headers=headers, timeout=15, **request_body
                 )
@@ -474,8 +543,8 @@ class OSMConductorBot:
                     # read. If it did not, try the existing explicit refresh
                     # fallback. Neither path logs or persists token values.
                     live_token = await self._get_live_access_token()
-                    if not live_token or live_token == token:
-                        live_token = await self._refresh_access_token()
+                    if not live_token or live_token == token or _token_expiring(live_token):
+                        live_token = await self._refresh_access_token(force=True)
                     if live_token:
                         headers["Authorization"] = f"Bearer {live_token}"
                         resp = await client.request(

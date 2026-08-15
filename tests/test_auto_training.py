@@ -355,6 +355,24 @@ class AutoTrainingManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.stats["errors"], 1)
         manager.reconcile.assert_awaited_once()
 
+    async def test_run_logs_first_successful_reconciliation(self):
+        stop = {"value": False}
+        logs = []
+        manager = AutoTrainingManager(
+            AsyncMock(), "123", "4", logs.append,
+            poll_interval=15, should_stop=lambda: stop["value"],
+        )
+        manager.reconcile = AsyncMock()
+
+        async def stop_after_sleep(_):
+            stop["value"] = True
+
+        with patch("auto_training.asyncio.sleep", side_effect=stop_after_sleep):
+            await manager.run()
+
+        manager.reconcile.assert_awaited_once()
+        self.assertIn("[TRAINING] reconciliation healthy", logs)
+
 
 if __name__ == "__main__":
     unittest.main()

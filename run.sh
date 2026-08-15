@@ -7,7 +7,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOADS_DIR="${OSM_DUMP_DIR:-/Users/ns0bj/Downloads}"
-DUMP_PATH="${1:-}"
+REQUESTED_DUMP="${1:-}"
+DUMP_PATH="${REQUESTED_DUMP}"
 HAR_PROFILE="${OSM_TRAINING_HAR:-${SCRIPT_DIR}/en.onlinesoccermanager.com-training.har}"
 RUNTIME_DIR="${SCRIPT_DIR}/tmp/osm-runtime"
 LOG="${OSM_LOG:-${RUNTIME_DIR}/conductor.log}"
@@ -32,20 +33,52 @@ if [ -z "${DUMP_PATH}" ] || { [ ! -d "${DUMP_PATH}" ] && [ ! -f "${DUMP_PATH}" ]
     exit 1
 fi
 
+extract_dump_arg() {
+    local command_line="$1"
+    printf '%s\n' "${command_line}" | sed -nE 's/.* --dump ([^ ]+).*/\1/p'
+}
+
 if [ -f "${PID_FILE}" ]; then
     EXISTING_PID="$(tail -n 1 "${PID_FILE}" 2>/dev/null | awk '{print $NF}')"
     if [ -n "${EXISTING_PID}" ] && kill -0 "${EXISTING_PID}" 2>/dev/null; then
         EXISTING_COMMAND="$(ps -p "${EXISTING_PID}" -o command= 2>/dev/null || true)"
         if [[ "${EXISTING_COMMAND}" == *"osm_ad_bot_conductor.py"* ]]; then
-            echo "Bot is already running with PID ${EXISTING_PID}."
-            echo "Attaching to its live log now."
-            echo "Press Ctrl+C to stop following logs; the bot keeps running."
-            echo "Stop the bot: kill ${EXISTING_PID}"
-            echo ""
-            tail -f "${LOG}"
-            exit 0
+            EXISTING_DUMP="$(extract_dump_arg "${EXISTING_COMMAND}")"
+            if [ -n "${EXISTING_DUMP}" ] && [ "${EXISTING_DUMP}" != "${DUMP_PATH}" ]; then
+                if [ "${OSM_RESTART_ON_NEW_DUMP:-1}" = "0" ]; then
+                    echo "ERROR: Bot PID ${EXISTING_PID} uses a different StorageDump."
+                    echo "Running : ${EXISTING_DUMP}"
+                    echo "Selected: ${DUMP_PATH}"
+                    echo "Stop PID ${EXISTING_PID}, then rerun ./run.sh (or unset OSM_RESTART_ON_NEW_DUMP=0)."
+                    exit 1
+                fi
+                echo "Bot PID ${EXISTING_PID} uses an older/different StorageDump."
+                echo "Reloading it with: ${DUMP_PATH}"
+                kill "${EXISTING_PID}"
+                for _ in $(seq 1 30); do
+                    if ! kill -0 "${EXISTING_PID}" 2>/dev/null; then
+                        break
+                    fi
+                    sleep 1
+                done
+                if kill -0 "${EXISTING_PID}" 2>/dev/null; then
+                    echo "ERROR: Existing bot PID ${EXISTING_PID} did not stop within 30s."
+                    echo "Stop it manually, then rerun ./run.sh."
+                    exit 1
+                fi
+                rm -f "${PID_FILE}"
+            else
+                echo "Bot is already running with PID ${EXISTING_PID}."
+                echo "Attaching to its live log now."
+                echo "Press Ctrl+C to stop following logs; the bot keeps running."
+                echo "Stop the bot: kill ${EXISTING_PID}"
+                echo ""
+                tail -f "${LOG}"
+                exit 0
+            fi
+        else
+            echo "Ignoring stale PID file: ${EXISTING_PID} belongs to another process."
         fi
-        echo "Ignoring stale PID file: ${EXISTING_PID} belongs to another process."
     fi
 fi
 
@@ -80,7 +113,7 @@ if [ -f "${HAR_PROFILE}" ]; then
 fi
 
 echo "Starting bot..."
-python3 osm_ad_bot_conductor.py "${ARGS[@]}" &
+nohup python3 osm_ad_bot_conductor.py "${ARGS[@]}" </dev/null >/dev/null 2>&1 &
 
 PID=$!
 echo ""

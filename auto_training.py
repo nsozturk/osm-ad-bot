@@ -522,6 +522,7 @@ class AutoTrainingManager:
 
     async def run(self) -> None:
         failures = 0
+        healthy_logged = False
         self.log(
             f"[TRAINING] manager enabled for league {self.league_id}, team {self.team_id}; "
             f"poll every {self.poll_interval}s"
@@ -529,6 +530,11 @@ class AutoTrainingManager:
         while not self.should_stop():
             try:
                 await self.reconcile()
+                if failures:
+                    self.log("[TRAINING] reconciliation recovered; API access restored")
+                elif not healthy_logged:
+                    self.log("[TRAINING] reconciliation healthy")
+                healthy_logged = True
                 failures = 0
                 delay = self.poll_interval
             except asyncio.CancelledError:

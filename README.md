@@ -55,7 +55,7 @@ python3 osm_ad_bot_conductor.py \
 ./run_conductor_headed.sh ~/my-osm-session/
 ```
 
-If the bot is already active, running `./run.sh` again attaches to the existing live log instead of starting a duplicate process. Pressing Ctrl+C stops only log following; use the printed `kill` command when you want to stop the bot itself.
+If the bot is already active with the same StorageDump, running `./run.sh` again attaches to the existing live log instead of starting a duplicate process. When a newer/different dump is selected, `run.sh` gracefully restarts the existing conductor with that dump so a post-login token is actually loaded. Set `OSM_RESTART_ON_NEW_DUMP=0` to disable that automatic reload. Pressing Ctrl+C stops only log following; use the printed `kill` command when you want to stop the bot itself.
 
 ## Automatic training
 
