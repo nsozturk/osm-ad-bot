@@ -31,7 +31,7 @@ Acts as the user-facing controller.
 - `logs`: follow the conductor log only.
 - `OSM_USE_LAUNCHD=0`: preserve the legacy direct background-launch fallback.
 
-The selected dump path is written to the ignored runtime directory. Token contents are never copied, printed, or added to the plist.
+The selected dump is staged as a mode-`0600` copy in the ignored runtime directory because a background LaunchAgent does not inherit Terminal's Downloads-folder privacy grant. Token contents are never printed or added to the plist.
 
 ### `launchd/osm-ad-bot-runner.sh`
 
@@ -57,7 +57,7 @@ The plist records the absolute repository, runner, Python, Downloads, log, and H
 ## Lifecycle and Data Flow
 
 1. `run.sh` selects an explicit dump or the newest valid dump.
-2. It stores only the dump path in the ignored runtime directory.
+2. It copies the dump to the ignored runtime directory with mode `0600` and stores the source/runtime paths there.
 3. It generates and validates the LaunchAgent plist.
 4. It unloads/reloads only when the plist or dump selection changes; otherwise it reuses the existing job.
 5. launchd starts the runner, which `exec`s the conductor.

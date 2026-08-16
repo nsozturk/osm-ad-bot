@@ -45,17 +45,30 @@ python3 osm_ad_bot_conductor.py \
 
 ### Convenience scripts
 ```bash
-# Select the newest StorageDump automatically; 8 watchers + auto-training
+# Select the newest StorageDump, start the user LaunchAgent, and follow logs
 ./run.sh
 
 # Or use an explicit post-login directory/ZIP
 ./run.sh ~/Downloads/storagedump_en.onlinesoccermanager.com_latest.zip
 
+# Start without following logs
+./run.sh start
+
+# Lifecycle controls
+./run.sh status
+./run.sh restart
+./run.sh stop
+./run.sh logs
+
 # 1 watcher, visible browser
 ./run_conductor_headed.sh ~/my-osm-session/
 ```
 
-If the bot is already active with the same StorageDump, running `./run.sh` again attaches to the existing live log instead of starting a duplicate process. When a newer/different dump is selected, `run.sh` gracefully restarts the existing conductor with that dump so a post-login token is actually loaded. Set `OSM_RESTART_ON_NEW_DUMP=0` to disable that automatic reload. Pressing Ctrl+C stops only log following; use the printed `kill` command when you want to stop the bot itself.
+On macOS, `run.sh` installs a per-user LaunchAgent at `~/Library/LaunchAgents/dev.nsozturk.osm-ad-bot.plist`. launchd owns the conductor process with `RunAtLoad` and `KeepAlive`, so a terminal, Codex session, or `tail -f` ending cannot take the bot down. The job does **not** use `caffeinate` and does not prevent system sleep; macOS pauses it during sleep and launchd resumes supervision after wake.
+
+Because background LaunchAgents do not inherit Terminal's Downloads-folder privacy grant, `run.sh` stages the selected StorageDump as a mode-`0600` runtime copy under ignored `tmp/osm-runtime/`. Only that copy's path reaches launchd; token values are never written to the plist or logs and the runtime directory is never tracked by git.
+
+If the bot is already active with the same StorageDump, running `./run.sh` again attaches to its live log instead of starting a duplicate. Selecting a newer/different dump restarts the LaunchAgent with that dump. Pressing Ctrl+C stops only log following. A direct `kill <pid>` is intentionally restarted by KeepAlive; use `./run.sh stop` for a persistent stop. Set `OSM_USE_LAUNCHD=0` only when you explicitly need the legacy direct-background fallback.
 
 ## Automatic training
 
