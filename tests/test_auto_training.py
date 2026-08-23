@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 import time
 import unittest
 from pathlib import Path
@@ -62,30 +61,30 @@ class AutoTrainingSelectionTests(unittest.TestCase):
         self.assertEqual((profile.league_id, profile.team_id), ("123", "4"))
         self.assertFalse(hasattr(profile, "token"))
 
-    def test_candidate_pool_excludes_low_yield_injured_listed_and_occupied(self):
+    def test_candidate_pool_excludes_below_90_injured_listed_and_occupied(self):
         players = [
-            {"id": 1, "name": "Best", "position": 1, "age": 21, "statAtt": 70, "injuryId": 0},
-            {"id": 2, "name": "Edge", "position": 1, "age": 20, "statAtt": 60, "injuryId": 0},
-            {"id": 3, "name": "Below", "position": 1, "age": 19, "statAtt": 60, "injuryId": 0},
-            {"id": 4, "name": "Injured", "position": 1, "age": 18, "statAtt": 60, "injuryId": 2},
-            {"id": 5, "name": "Listed", "position": 1, "age": 18, "statAtt": 60, "injuryId": 0},
-            {"id": 6, "name": "Occupied", "position": 1, "age": 18, "statAtt": 60, "injuryId": 0},
+            {"id": 1, "name": "Best", "position": 1, "age": 21, "statAtt": 95, "injuryId": 0},
+            {"id": 2, "name": "Edge", "position": 1, "age": 20, "statAtt": 90, "injuryId": 0},
+            {"id": 3, "name": "Below", "position": 1, "age": 19, "statAtt": 89, "injuryId": 0},
+            {"id": 4, "name": "Injured", "position": 1, "age": 18, "statAtt": 98, "injuryId": 2},
+            {"id": 5, "name": "Listed", "position": 1, "age": 18, "statAtt": 97, "injuryId": 0},
+            {"id": 6, "name": "Occupied", "position": 1, "age": 18, "statAtt": 96, "injuryId": 0},
         ]
         forecasts = [
-            {"playerId": 1, "forecast": 100},
+            {"playerId": 1, "forecast": 70},
             {"playerId": 2, "forecast": 92},
-            {"playerId": 3, "forecast": 89},
+            {"playerId": 3, "forecast": 100},
             {"playerId": 4, "forecast": 100},
             {"playerId": 5, "forecast": 100},
             {"playerId": 6, "forecast": 100},
         ]
         pool = build_candidate_pool(players, forecasts, 1, {6}, {5})
-        self.assertEqual([item.player["id"] for item in pool], [1, 2])
+        self.assertEqual([item.player["id"] for item in pool], [2, 1])
 
-    def test_very_young_outfield_player_below_floor_is_excluded(self):
+    def test_main_stat_90_is_included_and_89_is_rejected(self):
         players = [
-            {"id": 1, "position": 1, "age": 16, "statAtt": 49},
-            {"id": 2, "position": 1, "age": 23, "statAtt": 55},
+            {"id": 1, "position": 1, "age": 16, "statAtt": 89},
+            {"id": 2, "position": 1, "age": 40, "statAtt": 90},
         ]
         forecasts = [
             {"playerId": 1, "forecast": 100},
@@ -96,10 +95,10 @@ class AutoTrainingSelectionTests(unittest.TestCase):
 
         self.assertEqual([item.player["id"] for item in pool], [2])
 
-    def test_goalkeeper_below_floor_is_excluded_and_veteran_can_be_fallback(self):
+    def test_goalkeeper_uses_the_same_inclusive_90_threshold(self):
         players = [
-            {"id": 1, "position": 4, "age": 18, "statDef": 39},
-            {"id": 2, "position": 4, "age": 34, "statDef": 40},
+            {"id": 1, "position": 4, "age": 18, "statDef": 89},
+            {"id": 2, "position": 4, "age": 34, "statDef": 90},
         ]
         forecasts = [
             {"playerId": 1, "forecast": 100},
@@ -107,79 +106,98 @@ class AutoTrainingSelectionTests(unittest.TestCase):
         ]
 
         pool = build_candidate_pool(players, forecasts, 4, set(), set())
-        chosen = choose_candidate(pool, random.Random(1))
+        chosen = choose_candidate(pool)
 
         self.assertEqual([item.player["id"] for item in pool], [2])
         self.assertEqual(chosen.player["id"], 2)
 
-    def test_young_average_player_outranks_veteran_at_equal_forecast(self):
+    def test_highest_forecast_wins_regardless_of_age(self):
         players = [
-            {"id": 1, "position": 3, "age": 23, "statDef": 55},
-            {"id": 2, "position": 3, "age": 30, "statDef": 70},
+            {"id": 1, "position": 3, "age": 16, "statDef": 99},
+            {"id": 2, "position": 3, "age": 39, "statDef": 90},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 60},
+            {"playerId": 2, "forecast": 81},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 3, set(), set())
+
+        self.assertEqual([item.player["id"] for item in pool], [2, 1])
+        self.assertEqual(choose_candidate(pool).player["id"], 2)
+
+    def test_equal_forecast_prefers_higher_main_stat(self):
+        players = [
+            {"id": 1, "position": 2, "age": 21, "statOvr": 90},
+            {"id": 2, "position": 2, "age": 33, "statOvr": 97},
         ]
         forecasts = [
             {"playerId": 1, "forecast": 80},
             {"playerId": 2, "forecast": 80},
         ]
 
-        pool = build_candidate_pool(players, forecasts, 3, set(), set())
-
-        self.assertEqual([item.player["id"] for item in pool], [1])
-        self.assertEqual(pool[0].priority_score, 92.0)
-
-    def test_veteran_can_win_with_large_forecast_advantage(self):
-        players = [
-            {"id": 1, "position": 2, "age": 21, "statOvr": 55},
-            {"id": 2, "position": 2, "age": 33, "statOvr": 70},
-        ]
-        forecasts = [
-            {"playerId": 1, "forecast": 40},
-            {"playerId": 2, "forecast": 100},
-        ]
-
         pool = build_candidate_pool(players, forecasts, 2, set(), set())
 
-        self.assertEqual([item.player["id"] for item in pool], [2])
-        self.assertEqual(pool[0].priority_score, 60.0)
+        self.assertEqual([item.player["id"] for item in pool], [2, 1])
 
-    def test_below_floor_players_never_form_a_fallback_pool(self):
+    def test_equal_forecast_and_main_stat_prefers_lower_player_id(self):
         players = [
-            {"id": 1, "position": 1, "age": 18, "statAtt": 49},
-            {"id": 2, "position": 1, "age": 19, "statAtt": 30},
+            {"id": 20, "position": 1, "age": 18, "statAtt": 95},
+            {"id": 10, "position": 1, "age": 40, "statAtt": 95},
         ]
         forecasts = [
-            {"playerId": 1, "forecast": 100},
-            {"playerId": 2, "forecast": 100},
+            {"playerId": 20, "forecast": 75},
+            {"playerId": 10, "forecast": 75},
         ]
 
-        result = build_candidate_pool_result(players, forecasts, 1, set(), set())
+        pool = build_candidate_pool(players, forecasts, 1, set(), set())
 
-        self.assertEqual(result.candidates, [])
-        self.assertEqual(
-            result.empty_reason,
-            "all available candidates are below the minimum main stat",
-        )
+        self.assertEqual([item.player["id"] for item in pool], [10, 20])
+
+    def test_universal_coach_uses_forecast_universal(self):
+        players = [
+            {"id": 1, "position": 1, "age": 21, "statAtt": 95},
+            {"id": 2, "position": 2, "age": 22, "statOvr": 95},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 99, "forecastUniversal": 40},
+            {"playerId": 2, "forecast": 50, "forecastUniversal": 80},
+        ]
+
+        normal_pool = build_candidate_pool(players, forecasts, 1, set(), set())
+        universal_pool = build_candidate_pool(players, forecasts, 5, set(), set())
+
+        self.assertEqual(choose_candidate(normal_pool).player["id"], 1)
+        self.assertEqual(choose_candidate(universal_pool).player["id"], 2)
 
     def test_empty_pool_reasons_distinguish_forecast_and_unavailable_players(self):
-        player = {"id": 1, "position": 1, "age": 21, "statAtt": 60}
+        player = {"id": 1, "position": 1, "age": 21, "statAtt": 90}
+        below = {"id": 2, "position": 1, "age": 18, "statAtt": 89}
 
         no_forecast = build_candidate_pool_result([player], [], 1, set(), set())
+        below_floor = build_candidate_pool_result(
+            [below], [{"playerId": 2, "forecast": 100}], 1, set(), set()
+        )
         unavailable = build_candidate_pool_result(
             [player], [{"playerId": 1, "forecast": 100}], 1, {1}, set()
         )
 
         self.assertEqual(
             no_forecast.empty_reason,
-            "no positive forecast candidate above the minimum main stat",
+            "no positive forecast candidate at or above main stat 90",
+        )
+        self.assertEqual(
+            below_floor.empty_reason,
+            "all available candidates are below main stat 90",
         )
         self.assertEqual(
             unavailable.empty_reason,
             "all position candidates are occupied, injured, listed, or maxed",
         )
 
-    def test_weighted_choice_stays_inside_top_band(self):
+    def test_choice_is_repeatable_and_never_random(self):
         players = [
-            {"id": i, "position": 2, "age": 25, "statOvr": 50}
+            {"id": i, "position": 2, "age": 20 + i, "statOvr": 90 + i}
             for i in range(1, 8)
         ]
         forecasts = [
@@ -187,12 +205,10 @@ class AutoTrainingSelectionTests(unittest.TestCase):
             for i in range(1, 8)
         ]
         pool = build_candidate_pool(players, forecasts, 2, set(), set())
-        self.assertLessEqual(len(pool), 5)
-        first = choose_candidate(pool, random.Random(7))
-        second = choose_candidate(pool, random.Random(7))
-        self.assertIn(first, pool)
-        self.assertEqual(first.player["id"], second.player["id"])
-        self.assertTrue(all(item.priority_score >= pool[0].priority_score * 0.90 for item in pool))
+        choices = [choose_candidate(pool).player["id"] for _ in range(20)]
+
+        self.assertEqual(len(pool), 7)
+        self.assertEqual(choices, [1] * 20)
 
     def test_finished_session_uses_server_timestamp(self):
         session = {
@@ -231,11 +247,11 @@ class FakeTrainingApi:
             },
         ]
         self.players = [
-            {"id": 101, "name": "A1", "position": 1, "age": 21, "statAtt": 60, "injuryId": 0},
-            {"id": 102, "name": "M1", "position": 2, "age": 22, "statOvr": 60, "injuryId": 0},
-            {"id": 103, "name": "D1", "position": 3, "age": 23, "statDef": 60, "injuryId": 0},
-            {"id": 104, "name": "G1", "position": 4, "age": 24, "statDef": 60, "injuryId": 0},
-            {"id": 105, "name": "A2", "position": 1, "age": 19, "statAtt": 55, "injuryId": 0},
+            {"id": 101, "name": "A1", "position": 1, "age": 21, "statAtt": 95, "injuryId": 0},
+            {"id": 102, "name": "M1", "position": 2, "age": 22, "statOvr": 96, "injuryId": 0},
+            {"id": 103, "name": "D1", "position": 3, "age": 23, "statDef": 97, "injuryId": 0},
+            {"id": 104, "name": "G1", "position": 4, "age": 24, "statDef": 98, "injuryId": 0},
+            {"id": 105, "name": "A2", "position": 1, "age": 19, "statAtt": 94, "injuryId": 0},
         ]
         self.forecasts = [
             {"playerId": player["id"], "forecast": 70, "forecastUniversal": 80}
@@ -289,7 +305,7 @@ class AutoTrainingManagerTests(unittest.IsolatedAsyncioTestCase):
         api = FakeTrainingApi()
         logs = []
         manager = AutoTrainingManager(
-            api, "123", "4", logs.append, poll_interval=15, rng=random.Random(1)
+            api, "123", "4", logs.append, poll_interval=15
         )
 
         await manager.reconcile()
@@ -302,16 +318,17 @@ class AutoTrainingManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(player_ids), len(set(player_ids)))
         self.assertTrue(any("claimed completed session" in line for line in logs))
         self.assertTrue(any(
-            "stat " in line and "age " in line and "forecast " in line and "priority " in line
+            "stat " in line and "forecast " in line and "selection deterministic-max" in line
             for line in logs
         ))
+        self.assertFalse(any("priority " in line for line in logs))
         self.assertFalse(any("universaltrainer/buy" in endpoint for _, endpoint, _ in api.requests))
 
     async def test_candidate_ranking_failure_skips_only_affected_trainer(self):
         api = FakeTrainingApi()
         logs = []
         manager = AutoTrainingManager(
-            api, "123", "4", logs.append, poll_interval=15, rng=random.Random(1)
+            api, "123", "4", logs.append, poll_interval=15
         )
         original = build_candidate_pool_result
 

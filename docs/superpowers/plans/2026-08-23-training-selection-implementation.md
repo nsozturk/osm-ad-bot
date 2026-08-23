@@ -9,17 +9,17 @@ Replace age-weighted random automatic-training selection with a deterministic po
 
 ## Checklist
 
-- [ ] Replace the outfield/goalkeeper floors and priority-pool constants with one inclusive main-stat threshold of 90.
-- [ ] Remove age multipliers, priority scores, weighted candidate pools, and random selection from `auto_training.py`.
-- [ ] Preserve availability, injury, transfer-listing, occupied-player, max-stat, trainer-position, and positive-forecast filters.
-- [ ] Sort candidates by forecast descending, main stat descending, and numeric player ID ascending.
-- [ ] Make `choose_candidate` return the first ranked candidate deterministically.
-- [ ] Update success and empty-pool logs so they describe forecast-based selection and the 90 threshold accurately.
-- [ ] Rewrite focused unit tests for the inclusive threshold, forecast priority, age independence, deterministic tie-breaking, repeatability, and universal forecast field.
-- [ ] Update reconciliation fixtures to use eligible 90+ players while preserving existing claim/start/API behavior coverage.
-- [ ] Run focused automatic-training tests.
-- [ ] Run the complete repository test suite.
-- [ ] Review the final diff for unrelated edits, secret exposure, and compatibility with the conductor call site.
+- [x] Replace the outfield/goalkeeper floors and priority-pool constants with one inclusive main-stat threshold of 90.
+- [x] Remove age multipliers, priority scores, weighted candidate pools, and random selection from `auto_training.py`.
+- [x] Preserve availability, injury, transfer-listing, occupied-player, max-stat, trainer-position, and positive-forecast filters.
+- [x] Sort candidates by forecast descending, main stat descending, and numeric player ID ascending.
+- [x] Make `choose_candidate` return the first ranked candidate deterministically.
+- [x] Update success and empty-pool logs so they describe forecast-based selection and the 90 threshold accurately.
+- [x] Rewrite focused unit tests for the inclusive threshold, forecast priority, age independence, deterministic tie-breaking, repeatability, and universal forecast field.
+- [x] Update reconciliation fixtures to use eligible 90+ players while preserving existing claim/start/API behavior coverage.
+- [x] Run focused automatic-training tests.
+- [x] Run the complete repository test suite.
+- [x] Review the final diff for unrelated edits, secret exposure, and compatibility with the conductor call site.
 - [ ] Restart the LaunchAgent only after all tests pass.
 - [ ] Verify the new PID, healthy training reconciliation, and deterministic-selection log format.
 

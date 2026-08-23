@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import random
 import re
 import time
 from dataclasses import dataclass
@@ -22,10 +21,7 @@ NORMAL_TRAINING_TIMER_ID = 746
 UNIVERSAL_TRAINING_TIMER_ID = 982
 MAX_PLAYER_MAIN_STAT = 200
 UNIVERSAL_ENTITLEMENT_TIMER_TYPE = 16
-MIN_OUTFIELD_MAIN_STAT = 50
-MIN_GOALKEEPER_MAIN_STAT = 40
-PRIORITY_POOL_RATIO = 0.90
-PRIORITY_POOL_LIMIT = 5
+MIN_TRAINING_MAIN_STAT = 90
 
 TRAINERS = {
     1: ("attacker", 1, "forecast"),
@@ -50,8 +46,6 @@ class Candidate:
     forecast: int
     main_stat: int
     age: int
-    age_multiplier: float
-    priority_score: float
 
 
 @dataclass(frozen=True)
@@ -189,26 +183,6 @@ def player_main_stat(player: dict[str, Any]) -> int:
     return _safe_int(player.get("statDef"))
 
 
-def minimum_main_stat(player: dict[str, Any]) -> int:
-    if _safe_int(player.get("position")) == 4:
-        return MIN_GOALKEEPER_MAIN_STAT
-    return MIN_OUTFIELD_MAIN_STAT
-
-
-def training_age_multiplier(age: int) -> float:
-    if age <= 0:
-        return 0.60
-    if age <= 21:
-        return 1.25
-    if age <= 24:
-        return 1.15
-    if age <= 28:
-        return 1.00
-    if age <= 31:
-        return 0.80
-    return 0.60
-
-
 def listed_player_ids(transfers: list[dict[str, Any]], squad_ids: set[int]) -> set[int]:
     result: set[int] = set()
     for entry in transfers:
@@ -256,10 +230,12 @@ def build_candidate_pool_result(
     above_floor = [
         (player, player_id, main_stat)
         for player, player_id, main_stat in available_players
-        if main_stat >= minimum_main_stat(player)
+        if main_stat >= MIN_TRAINING_MAIN_STAT
     ]
     if not above_floor:
-        return CandidatePoolResult([], "all available candidates are below the minimum main stat")
+        return CandidatePoolResult(
+            [], f"all available candidates are below main stat {MIN_TRAINING_MAIN_STAT}"
+        )
 
     candidates: list[Candidate] = []
     for player, player_id, main_stat in above_floor:
@@ -267,33 +243,25 @@ def build_candidate_pool_result(
         if forecast <= 0:
             continue
         age = _safe_int(player.get("age"), 99)
-        age_multiplier = training_age_multiplier(age)
         candidates.append(Candidate(
             player=player,
             forecast=forecast,
             main_stat=main_stat,
             age=age,
-            age_multiplier=age_multiplier,
-            priority_score=forecast * age_multiplier,
         ))
 
     candidates.sort(
         key=lambda item: (
-            -item.priority_score,
             -item.forecast,
-            item.age,
             -item.main_stat,
             _safe_int(item.player.get("id")),
         )
     )
     if not candidates:
-        return CandidatePoolResult([], "no positive forecast candidate above the minimum main stat")
-    best_score = candidates[0].priority_score
-    pool = [
-        item for item in candidates
-        if item.priority_score >= best_score * PRIORITY_POOL_RATIO
-    ][:PRIORITY_POOL_LIMIT]
-    return CandidatePoolResult(pool)
+        return CandidatePoolResult(
+            [], f"no positive forecast candidate at or above main stat {MIN_TRAINING_MAIN_STAT}"
+        )
+    return CandidatePoolResult(candidates)
 
 
 def build_candidate_pool(
@@ -313,17 +281,10 @@ def build_candidate_pool(
     ).candidates
 
 
-def choose_candidate(pool: list[Candidate], rng: Optional[random.Random] = None) -> Optional[Candidate]:
+def choose_candidate(pool: list[Candidate]) -> Optional[Candidate]:
     if not pool:
         return None
-    rng = rng or random.SystemRandom()
-    weights = [item.priority_score ** 2 for item in pool]
-    cursor = rng.random() * sum(weights)
-    for item, weight in zip(pool, weights):
-        cursor -= weight
-        if cursor <= 0:
-            return item
-    return pool[-1]
+    return pool[0]
 
 
 def session_finished(session: dict[str, Any], now: Optional[int] = None) -> bool:
@@ -359,7 +320,6 @@ class AutoTrainingManager:
         universal_timer_id: int = UNIVERSAL_TRAINING_TIMER_ID,
         poll_interval: int = 60,
         should_stop: Callable[[], bool] = lambda: False,
-        rng: Optional[random.Random] = None,
     ):
         self.api_request = api_request
         self.league_id = str(league_id)
@@ -369,7 +329,6 @@ class AutoTrainingManager:
         self.universal_timer_id = int(universal_timer_id)
         self.poll_interval = max(15, int(poll_interval))
         self.should_stop = should_stop
-        self.rng = rng
         self.stats = {"claimed": 0, "started": 0, "errors": 0}
         self._lock = asyncio.Lock()
         self._universal_probe_failed = False
@@ -416,8 +375,7 @@ class AutoTrainingManager:
             self.log(
                 f"[TRAINING] trainer {trainer} started {name} "
                 f"(player {payload['playerId']}, stat {candidate.main_stat}, "
-                f"age {candidate.age}, forecast {candidate.forecast}, "
-                f"priority {candidate.priority_score:.1f})"
+                f"forecast {candidate.forecast}, selection deterministic-max)"
             )
             return True, status
         self.log(
@@ -445,7 +403,7 @@ class AutoTrainingManager:
             if not result.candidates:
                 self.log(f"[TRAINING] trainer {trainer} empty: {result.empty_reason}")
                 return None
-            return choose_candidate(result.candidates, self.rng)
+            return choose_candidate(result.candidates)
         except Exception:
             self.stats["errors"] += 1
             self.log(f"[TRAINING] trainer {trainer} candidate ranking failed; skipping this pass")
