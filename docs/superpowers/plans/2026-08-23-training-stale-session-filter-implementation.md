@@ -13,5 +13,5 @@
 - [x] Preserve claim-first flow and universal coach behavior.
 - [x] Run focused automatic-training tests.
 - [x] Run the complete test suite.
-- [ ] Restart the launchd-managed bot.
-- [ ] Verify the new PID, 60-second poll, occupancy status log, and refill outcome.
+- [x] Restart the launchd-managed bot.
+- [x] Verify the new PID, 60-second poll, occupancy status log, and refill outcome.

@@ -75,6 +75,7 @@ If the bot is already active with the same StorageDump, running `./run.sh` again
 With `--auto-training`, the conductor runs a separate, failure-isolated training manager:
 
 - Claims completed training sessions before refilling slots.
+- Ignores stale claimed or provably finished `ongoing` session records when deciding whether a coach is occupied, so an API/UI mismatch cannot silently block a refill.
 - Fills attacker, midfielder, defender, and goalkeeper trainers with matching players.
 - Uses `forecast` for normal trainers and `forecastUniversal` for the universal trainer.
 - Considers only players whose position-specific main stat is at least 90: `statAtt` for forwards, `statOvr` for midfielders, and `statDef` for defenders and goalkeepers.
