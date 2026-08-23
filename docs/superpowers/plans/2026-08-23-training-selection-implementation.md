@@ -20,8 +20,9 @@ Replace age-weighted random automatic-training selection with a deterministic po
 - [x] Run focused automatic-training tests.
 - [x] Run the complete repository test suite.
 - [x] Review the final diff for unrelated edits, secret exposure, and compatibility with the conductor call site.
-- [ ] Restart the LaunchAgent only after all tests pass.
-- [ ] Verify the new PID, healthy training reconciliation, and deterministic-selection log format.
+- [x] Restart the LaunchAgent only after all tests pass.
+- [x] Verify the new PID and healthy training reconciliation after restart.
+- [ ] Observe the first live `selection deterministic-max` start log when a trainer naturally becomes free; do not cancel an active training merely to force this log.
 
 ## Files
 
