@@ -77,9 +77,11 @@ With `--auto-training`, the conductor runs a separate, failure-isolated training
 - Claims completed training sessions before refilling slots.
 - Fills attacker, midfielder, defender, and goalkeeper trainers with matching players.
 - Uses `forecast` for normal trainers and `forecastUniversal` for the universal trainer.
-- Scores candidates as `forecast × age multiplier`: `1.25` through age 21, `1.15` for 22–24, `1.00` for 25–28, `0.80` for 29–31, and `0.60` from age 32 onward.
-- Randomly selects from up to five players within 90% of the best current priority score, weighted toward the higher score. A player whose yield drops after repeated training naturally loses priority.
-- Excludes outfield players below main stat 50 and goalkeepers below 40, even when they are very young; these floors are never relaxed as a fallback.
+- Considers only players whose position-specific main stat is at least 90: `statAtt` for forwards, `statOvr` for midfielders, and `statDef` for defenders and goalkeepers.
+- Deterministically selects the eligible player with the highest current forecast. Age does not affect eligibility or ranking, and there is no random choice.
+- Breaks equal forecasts by higher main stat, then by lower numeric player ID for stable, repeatable selection.
+- Trusts the current API forecast after repeated same-day sessions. If the same player still has the highest forecast, that player can be selected again.
+- Leaves a trainer idle for that reconciliation pass when no available 90+ player has a positive forecast.
 - Excludes injured players, players already training, max-level players, and players listed for transfer.
 - Keeps the OSM conductor page awake during ad cooldowns so the frontend continues rotating the short-lived token required by automatic training.
 - Never buys a universal trainer, boosts a timer, converts Boss Coins, buys a player, or changes a transfer listing.
