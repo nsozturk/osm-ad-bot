@@ -12,6 +12,7 @@ from auto_training import (
     choose_candidate,
     load_training_profile,
     session_finished,
+    session_occupies_slot,
 )
 
 
@@ -220,6 +221,65 @@ class AutoTrainingSelectionTests(unittest.TestCase):
         }
         self.assertTrue(session_finished(session, now=100))
 
+    def test_claimed_session_does_not_occupy_a_slot(self):
+        session = {
+            "trainer": 1,
+            "playerId": 101,
+            "countdownTimer": {
+                "currentTimestamp": 200,
+                "finishedTimestamp": 300,
+                "isClaimed": True,
+            },
+        }
+
+        self.assertFalse(session_occupies_slot(session, now=200))
+
+    def test_finished_session_does_not_occupy_a_slot(self):
+        session = {
+            "trainer": 1,
+            "playerId": 101,
+            "countdownTimer": {
+                "currentTimestamp": 200,
+                "finishedTimestamp": 199,
+                "isClaimed": False,
+            },
+        }
+
+        self.assertFalse(session_occupies_slot(session, now=100))
+
+    def test_future_session_occupies_a_slot(self):
+        session = {
+            "trainer": 1,
+            "playerId": 101,
+            "countdownTimer": {
+                "currentTimestamp": 200,
+                "finishedTimestamp": 300,
+                "isClaimed": False,
+            },
+        }
+
+        self.assertTrue(session_occupies_slot(session, now=100))
+
+    def test_session_without_finished_timestamp_is_conservatively_active(self):
+        session = {
+            "trainer": 1,
+            "playerId": 101,
+            "countdownTimer": {"isClaimed": False},
+        }
+
+        self.assertTrue(session_occupies_slot(session, now=100))
+
+    def test_session_without_valid_identifiers_cannot_occupy_a_slot(self):
+        session = {
+            "trainer": 1,
+            "countdownTimer": {
+                "finishedTimestamp": 300,
+                "isClaimed": False,
+            },
+        }
+
+        self.assertFalse(session_occupies_slot(session, now=100))
+
 
 class FakeTrainingApi:
     def __init__(self):
@@ -300,6 +360,26 @@ class FakeTrainingApi:
         return 500, {}
 
 
+class StickyClaimTrainingApi(FakeTrainingApi):
+    async def __call__(self, method, endpoint, payload=None):
+        if endpoint.endswith("/claim"):
+            self.requests.append((method, endpoint, payload))
+            session_id = int(endpoint.split("/")[-2])
+            for session in self.sessions:
+                if session["id"] == session_id:
+                    session["countdownTimer"]["isClaimed"] = True
+            return 200, {"progressImprovement": 10}
+        return await super().__call__(method, endpoint, payload)
+
+
+class AlreadyResolvedTrainingApi(FakeTrainingApi):
+    async def __call__(self, method, endpoint, payload=None):
+        if endpoint.endswith("/claim"):
+            self.requests.append((method, endpoint, payload))
+            return 409, {}
+        return await super().__call__(method, endpoint, payload)
+
+
 class AutoTrainingManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_reconcile_claims_finished_and_fills_each_free_slot_once(self):
         api = FakeTrainingApi()
@@ -323,6 +403,52 @@ class AutoTrainingManagerTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertFalse(any("priority " in line for line in logs))
         self.assertFalse(any("universaltrainer/buy" in endpoint for _, endpoint, _ in api.requests))
+
+    async def test_claimed_session_retained_by_api_does_not_block_refill(self):
+        api = StickyClaimTrainingApi()
+        logs = []
+        manager = AutoTrainingManager(api, "123", "4", logs.append, poll_interval=15)
+
+        await manager.reconcile()
+
+        trainer_one_sessions = [
+            session for session in api.sessions if session["trainer"] == 1
+        ]
+        self.assertEqual(manager.stats["claimed"], 1)
+        self.assertEqual(len(trainer_one_sessions), 2)
+        self.assertTrue(trainer_one_sessions[0]["countdownTimer"]["isClaimed"])
+        self.assertFalse(trainer_one_sessions[1]["countdownTimer"]["isClaimed"])
+        self.assertTrue(any("trainer 1 started" in line for line in logs))
+
+    async def test_finished_session_retained_after_409_does_not_block_refill(self):
+        api = AlreadyResolvedTrainingApi()
+        logs = []
+        manager = AutoTrainingManager(api, "123", "4", logs.append, poll_interval=15)
+
+        await manager.reconcile()
+
+        trainer_one_sessions = [
+            session for session in api.sessions if session["trainer"] == 1
+        ]
+        self.assertEqual(manager.stats["claimed"], 0)
+        self.assertEqual(len(trainer_one_sessions), 2)
+        self.assertTrue(any("already resolved" in line for line in logs))
+        self.assertTrue(any("trainer 1 started" in line for line in logs))
+
+    async def test_normal_coach_occupancy_log_is_not_repeated_without_change(self):
+        api = FakeTrainingApi()
+        logs = []
+        manager = AutoTrainingManager(api, "123", "4", logs.append, poll_interval=15)
+
+        await manager.reconcile()
+        await manager.reconcile()
+
+        occupancy_logs = [
+            line for line in logs if "normal coaches active=" in line
+        ]
+        self.assertEqual(len(occupancy_logs), 1)
+        self.assertIn("active=1,2,3,4", occupancy_logs[0])
+        self.assertIn("empty=none", occupancy_logs[0])
 
     async def test_candidate_ranking_failure_skips_only_affected_trainer(self):
         api = FakeTrainingApi()

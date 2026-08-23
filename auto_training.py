@@ -297,6 +297,28 @@ def session_finished(session: dict[str, Any], now: Optional[int] = None) -> bool
     return bool(finished and finished <= compare)
 
 
+def session_occupies_slot(session: dict[str, Any], now: Optional[int] = None) -> bool:
+    """Return whether an ongoing-session record still represents live training."""
+    trainer = _safe_int(session.get("trainer"))
+    player_id = _safe_int(session.get("playerId"))
+    if trainer not in TRAINERS or not player_id:
+        return False
+
+    timer = session.get("countdownTimer") or {}
+    if timer.get("isClaimed"):
+        return False
+
+    finished = _safe_int(timer.get("finishedTimestamp"))
+    if not finished:
+        # Older or partial payloads are treated conservatively so a live
+        # training session is never replaced just because its timer is absent.
+        return True
+
+    server_now = _safe_int(timer.get("currentTimestamp"))
+    compare = max(_safe_int(now, int(time.time())), server_now)
+    return finished > compare
+
+
 def has_universal_entitlement(timers: list[dict[str, Any]], now: Optional[int] = None) -> bool:
     current = _safe_int(now, int(time.time()))
     return any(
@@ -333,6 +355,7 @@ class AutoTrainingManager:
         self._lock = asyncio.Lock()
         self._universal_probe_failed = False
         self._universal_timer_signature: tuple[Any, ...] = ()
+        self._normal_occupancy_signature: Optional[tuple[int, ...]] = None
 
     @property
     def base(self) -> str:
@@ -421,6 +444,16 @@ class AutoTrainingManager:
             for timer in timers
         ))
 
+    def _log_normal_occupancy(self, occupied_trainers: set[int]) -> None:
+        active = tuple(trainer for trainer in (1, 2, 3, 4) if trainer in occupied_trainers)
+        if active == self._normal_occupancy_signature:
+            return
+        self._normal_occupancy_signature = active
+        empty = tuple(trainer for trainer in (1, 2, 3, 4) if trainer not in occupied_trainers)
+        active_text = ",".join(map(str, active)) or "none"
+        empty_text = ",".join(map(str, empty)) or "none"
+        self.log(f"[TRAINING] normal coaches active={active_text}; empty={empty_text}")
+
     async def reconcile(self) -> None:
         async with self._lock:
             sessions = await self._get("/trainingsessions/ongoing", empty_404=True)
@@ -444,8 +477,13 @@ class AutoTrainingManager:
             if not all(isinstance(value, list) for value in (players, forecasts, transfers, timers)):
                 raise TrainingApiError("decode training state", 0)
 
-            occupied_trainers = {_safe_int(item.get("trainer")) for item in sessions}
-            occupied_players = {_safe_int(item.get("playerId")) for item in sessions}
+            active_sessions = [item for item in sessions if session_occupies_slot(item)]
+            occupied_trainers = {
+                _safe_int(item.get("trainer")) for item in active_sessions
+            }
+            occupied_players = {
+                _safe_int(item.get("playerId")) for item in active_sessions
+            }
             squad_ids = {_safe_int(player.get("id")) for player in players}
             listed_ids = listed_player_ids(transfers, squad_ids)
 
@@ -462,6 +500,8 @@ class AutoTrainingManager:
                     occupied_trainers.add(trainer)
                     occupied_players.add(_safe_int(candidate.player.get("id")))
                     sessions = await self._get("/trainingsessions/ongoing", empty_404=True)
+
+            self._log_normal_occupancy(occupied_trainers)
 
             signature = self._timer_signature(timers)
             if signature != self._universal_timer_signature:
