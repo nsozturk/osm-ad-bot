@@ -27,6 +27,9 @@ Use explicit page ownership plus a final context sweep:
 4. Cleanup logs page counts before and after the sweep.
 5. If cleanup cannot return to a conductor-only baseline, it logs a warning;
    it does not silently accumulate pages or immediately destroy the context.
+6. Every lifecycle close is bounded to five seconds. A timeout is logged and
+   the conductor continues, allowing the final sweep or process supervision to
+   recover instead of freezing on an unresponsive renderer.
 
 This combines precise local cleanup with a defensive recovery seam. Closing
 only failed pages would fix the known path but would not recover pages leaked by
@@ -46,6 +49,8 @@ would be more disruptive and would complicate token/session continuity.
   races.
 - The conductor page is the only protected page during end-of-cycle cleanup.
 - Closed pages and close failures are handled idempotently.
+- Watcher, scout, and defensive-sweep close operations use the same bounded
+  close helper.
 
 ## Compatibility and Live Impact
 
@@ -64,6 +69,7 @@ would be more disruptive and would complicate token/session continuity.
 - Cleanup cancels and awaits tasks, closes tracked pages, and clears tracking.
 - Cleanup closes an untracked stray page but preserves the conductor.
 - Repeated cleanup is safe and retains the conductor-only baseline.
+- A hanging page close times out without blocking the conductor loop.
 
 ## Live Verification
 

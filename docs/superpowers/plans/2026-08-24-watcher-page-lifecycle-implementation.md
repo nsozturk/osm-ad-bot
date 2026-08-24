@@ -16,6 +16,8 @@
 - [x] Await watcher task cancellation during cleanup.
 - [x] Sweep non-conductor stray context pages.
 - [x] Add before/after page-count cleanup diagnostics.
+- [ ] Add bounded-close timeout regression coverage.
+- [ ] Apply bounded close to watcher, scout, and defensive cleanup paths.
 - [x] Run focused lifecycle tests.
 - [x] Run the complete test suite and compile checks.
 - [ ] Restart the launchd-managed bot.
