@@ -857,7 +857,7 @@ class OSMConductorBot:
                 if page.is_closed():
                     self._log(f"{prefix} ▶ Tab already closed, exiting")
                     return
-                ok = await self._watch_single_ad(page, tab_id)
+                ok = await self._watch_single_ad_bounded(page, tab_id)
                 # Single-ad policy: close tab after every attempt
                 self._log(f"{prefix} ▶ Closing tab...")
                 if await self._close_page_bounded(page, f"{prefix} tab"):
@@ -885,6 +885,20 @@ class OSMConductorBot:
                 self._log(f"{prefix} ! Error: {e}")
                 self.stats["errors"] += 1
                 await asyncio.sleep(10)
+
+    async def _watch_single_ad_bounded(
+        self, page: Page, tab_id: int, timeout: Optional[float] = None
+    ) -> bool:
+        limit = timeout if timeout is not None else max(180, self.ad_duration + 90)
+        try:
+            return await asyncio.wait_for(
+                self._watch_single_ad(page, tab_id), timeout=limit
+            )
+        except asyncio.TimeoutError:
+            self._log(
+                f"[W{tab_id}] ! ad attempt timeout after {limit:g}s; closing page"
+            )
+            return False
 
     async def _watch_single_ad(self, page: Page, tab_id: int) -> bool:
         prefix = f"[W{tab_id}]"
@@ -1044,7 +1058,7 @@ class OSMConductorBot:
             await asyncio.sleep(2)
             
             self._log("[SCOUT] Step 2/3: Watching 1 ad to test rate-limit...")
-            ok = await self._watch_single_ad(scout, tab_id=99)  # 99 = scout
+            ok = await self._watch_single_ad_bounded(scout, tab_id=99)  # 99 = scout
             
             self._log("[SCOUT] Step 3/3: Checking rate-limit AFTER ad...")
             if not scout.is_closed():

@@ -114,6 +114,21 @@ class WatcherCleanupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.close_calls, 1)
         self.assertTrue(any("hanging test close timeout" in line for line in bot.logs))
 
+    async def test_hanging_ad_attempt_times_out_without_blocking(self):
+        page = FakePage()
+        bot = make_bot(FakeContext([page]))
+        bot.ad_duration = 120
+
+        async def hang_forever(*_args):
+            await asyncio.Event().wait()
+
+        bot._watch_single_ad = hang_forever
+
+        watched = await bot._watch_single_ad_bounded(page, 99, timeout=0.01)
+
+        self.assertFalse(watched)
+        self.assertTrue(any("ad attempt timeout" in line for line in bot.logs))
+
     async def test_cleanup_awaits_tasks_closes_tracked_and_stray_pages(self):
         conductor = FakePage()
         tracked = FakePage()

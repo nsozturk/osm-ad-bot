@@ -30,6 +30,10 @@ Use explicit page ownership plus a final context sweep:
 6. Every lifecycle close is bounded to five seconds. A timeout is logged and
    the conductor continues, allowing the final sweep or process supervision to
    recover instead of freezing on an unresponsive renderer.
+7. A complete ad attempt is bounded to the configured real-ad duration plus 90
+   seconds. This still permits the legitimate 120-second fallback wait while
+   preventing a stuck renderer protocol call from freezing the scout or watcher
+   loop indefinitely.
 
 This combines precise local cleanup with a defensive recovery seam. Closing
 only failed pages would fix the known path but would not recover pages leaked by
@@ -70,6 +74,7 @@ would be more disruptive and would complicate token/session continuity.
 - Cleanup closes an untracked stray page but preserves the conductor.
 - Repeated cleanup is safe and retains the conductor-only baseline.
 - A hanging page close times out without blocking the conductor loop.
+- A hanging ad attempt times out and returns control to page cleanup.
 
 ## Live Verification
 
