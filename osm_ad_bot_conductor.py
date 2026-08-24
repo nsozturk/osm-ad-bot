@@ -641,6 +641,21 @@ class OSMConductorBot:
     # ------------------------------------------------------------------
     # Watcher tab lifecycle
     # ------------------------------------------------------------------
+    async def _close_page_bounded(
+        self, page: Optional[Page], label: str, timeout: float = 5.0
+    ) -> bool:
+        """Close a page without allowing an unresponsive renderer to stall."""
+        if not page or page.is_closed():
+            return True
+        try:
+            await asyncio.wait_for(page.close(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            self._log(f"[WATCHERS]   {label} close timeout after {timeout:g}s")
+        except Exception as exc:
+            self._log(f"[WATCHERS]   {label} close error: {exc}")
+        return False
+
     async def _open_watchers(self):
         self._log("[WATCHERS] Opening {} watcher tabs...".format(self.watcher_tabs))
         opened = 0
@@ -660,16 +675,8 @@ class OSMConductorBot:
                 self._log("[WATCHERS]   Tab {} failed: {}".format(i, e))
                 if page in self.watcher_pages:
                     self.watcher_pages.remove(page)
-                try:
-                    if page and not page.is_closed():
-                        await page.close()
-                        self._log("[WATCHERS]   Tab {} failed page closed".format(i))
-                except Exception as close_error:
-                    self._log(
-                        "[WATCHERS]   Tab {} failed page close error: {}".format(
-                            i, close_error
-                        )
-                    )
+                if await self._close_page_bounded(page, f"Tab {i} failed page"):
+                    self._log("[WATCHERS]   Tab {} failed page closed".format(i))
         self._log("[WATCHERS] {}/{} tabs ready".format(opened, self.watcher_tabs))
 
     async def _close_all_watchers(self):
@@ -689,12 +696,10 @@ class OSMConductorBot:
 
         closed = 0
         for page in list(self.watcher_pages):
-            try:
-                if not page.is_closed():
-                    await page.close()
-                    closed += 1
-            except Exception:
-                pass
+            if not page.is_closed() and await self._close_page_bounded(
+                page, "tracked watcher"
+            ):
+                closed += 1
         self.watcher_pages.clear()
 
         # Defensive ownership sweep: failed watcher setup paths are not allowed
@@ -704,12 +709,10 @@ class OSMConductorBot:
             for page in list(self.context.pages):
                 if page is self.conductor_page:
                     continue
-                try:
-                    if not page.is_closed():
-                        await page.close()
-                        stray_closed += 1
-                except Exception as exc:
-                    self._log(f"[WATCHERS]   stray page close error: {exc}")
+                if not page.is_closed() and await self._close_page_bounded(
+                    page, "stray page"
+                ):
+                    stray_closed += 1
 
         pages_after = len(self.context.pages) if self.context else 0
         self._log(
@@ -857,12 +860,8 @@ class OSMConductorBot:
                 ok = await self._watch_single_ad(page, tab_id)
                 # Single-ad policy: close tab after every attempt
                 self._log(f"{prefix} ▶ Closing tab...")
-                try:
-                    if not page.is_closed():
-                        await page.close()
-                        self._log(f"{prefix} ▶ Tab closed")
-                except Exception as e:
-                    self._log(f"{prefix} ! Close error: {e}")
+                if await self._close_page_bounded(page, f"{prefix} tab"):
+                    self._log(f"{prefix} ▶ Tab closed")
                 # Remove from tracking list
                 try:
                     if page in self.watcher_pages:
@@ -1049,7 +1048,7 @@ class OSMConductorBot:
             
             self._log("[SCOUT] Step 3/3: Checking rate-limit AFTER ad...")
             if not scout.is_closed():
-                await scout.close()
+                await self._close_page_bounded(scout, "scout")
             
             # CRITICAL: Check rate-limit AFTER watching the ad
             api_limit = await self._check_api_rate_limit()
@@ -1068,11 +1067,7 @@ class OSMConductorBot:
                 
         except Exception as e:
             self._log("[SCOUT] ! Error: {}".format(e))
-            try:
-                if not scout.is_closed():
-                    await scout.close()
-            except Exception:
-                pass
+            await self._close_page_bounded(scout, "scout failure")
             return False
 
     async def _conductor_loop(self):
@@ -1157,11 +1152,7 @@ class OSMConductorBot:
                 # Try close again if anything still open
                 if self.watcher_pages:
                     for p in list(self.watcher_pages):
-                        try:
-                            if not p.is_closed():
-                                await p.close()
-                        except Exception:
-                            pass
+                        await self._close_page_bounded(p, "confirmation watcher")
                     self.watcher_pages.clear()
             
             self._log("[CYCLE] ✅ All watchers confirmed closed. {} ads watched this cycle.".format(

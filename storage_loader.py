@@ -1,4 +1,5 @@
 """Load and inject browser storage dumps into a Playwright context."""
+import asyncio
 import json
 import zipfile
 from pathlib import Path
@@ -148,7 +149,7 @@ class StorageLoader:
             finally:
                 if page is not None:
                     try:
-                        await page.close()
+                        await asyncio.wait_for(page.close(), timeout=5)
                     except Exception:
                         pass
 
@@ -174,6 +175,6 @@ class StorageLoader:
             finally:
                 if page is not None:
                     try:
-                        await page.close()
+                        await asyncio.wait_for(page.close(), timeout=5)
                     except Exception:
                         pass

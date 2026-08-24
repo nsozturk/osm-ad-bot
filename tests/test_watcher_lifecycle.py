@@ -99,6 +99,21 @@ class WatcherOpenLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WatcherCleanupLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hanging_page_close_times_out_without_blocking(self):
+        class HangingClosePage(FakePage):
+            async def close(self):
+                self.close_calls += 1
+                await asyncio.Event().wait()
+
+        page = HangingClosePage()
+        bot = make_bot(FakeContext([page]))
+
+        closed = await bot._close_page_bounded(page, "hanging test", timeout=0.01)
+
+        self.assertFalse(closed)
+        self.assertEqual(page.close_calls, 1)
+        self.assertTrue(any("hanging test close timeout" in line for line in bot.logs))
+
     async def test_cleanup_awaits_tasks_closes_tracked_and_stray_pages(self):
         conductor = FakePage()
         tracked = FakePage()
