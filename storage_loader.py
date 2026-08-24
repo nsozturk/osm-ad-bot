@@ -4,6 +4,7 @@ import json
 import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 class StorageLoader:
     """Parses a StorageDump export and applies cookies/local/session storage."""
@@ -121,6 +122,18 @@ class StorageLoader:
             if archive is not None:
                 archive.close()
 
+    @staticmethod
+    def _is_osm_origin(origin: str) -> bool:
+        """Only OSM web storage is needed to restore the authenticated SPA."""
+        try:
+            hostname = (urlparse(origin).hostname or "").lower()
+        except ValueError:
+            return False
+        return (
+            hostname == "onlinesoccermanager.com"
+            or hostname.endswith(".onlinesoccermanager.com")
+        )
+
     async def inject(self, context):
         """Inject cookies and storage into a Playwright BrowserContext."""
         if self.cookies:
@@ -129,6 +142,8 @@ class StorageLoader:
         # Group storage items by origin to minimise page creation
         origins_local: dict[str, list[dict]] = {}
         for item in self.local_storage:
+            if not self._is_osm_origin(item["origin"]):
+                continue
             origins_local.setdefault(item["origin"], []).append(item)
 
         for origin, items in origins_local.items():
@@ -155,6 +170,8 @@ class StorageLoader:
 
         origins_session: dict[str, list[dict]] = {}
         for item in self.session_storage:
+            if not self._is_osm_origin(item["origin"]):
+                continue
             origins_session.setdefault(item["origin"], []).append(item)
 
         for origin, items in origins_session.items():

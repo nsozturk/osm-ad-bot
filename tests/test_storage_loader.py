@@ -59,15 +59,36 @@ class FakeInjectionPage:
 class FakeInjectionContext:
     def __init__(self, pages):
         self.pages = list(pages)
+        self.new_page_calls = 0
 
     async def add_cookies(self, _cookies):
         return None
 
     async def new_page(self):
+        self.new_page_calls += 1
         return self.pages.pop(0)
 
 
 class StorageLoaderInjectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_osm_storage_origins_are_skipped_without_opening_pages(self):
+        context = FakeInjectionContext([])
+        loader = object.__new__(StorageLoader)
+        loader.cookies = []
+        loader.local_storage = [{
+            "origin": "https://www.google.com",
+            "key": "local-key",
+            "value": "local-value",
+        }]
+        loader.session_storage = [{
+            "origin": "https://doubleclick.net",
+            "key": "session-key",
+            "value": "session-value",
+        }]
+
+        await loader.inject(context)
+
+        self.assertEqual(context.new_page_calls, 0)
+
     async def test_failed_local_and_session_origins_close_temporary_pages(self):
         local_page = FakeInjectionPage(RuntimeError("local navigation failed"))
         session_page = FakeInjectionPage(RuntimeError("session navigation failed"))
@@ -75,12 +96,12 @@ class StorageLoaderInjectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         loader = object.__new__(StorageLoader)
         loader.cookies = []
         loader.local_storage = [{
-            "origin": "https://local.example",
+            "origin": "https://local.onlinesoccermanager.com",
             "key": "local-key",
             "value": "local-value",
         }]
         loader.session_storage = [{
-            "origin": "https://session.example",
+            "origin": "https://session.onlinesoccermanager.com",
             "key": "session-key",
             "value": "session-value",
         }]
