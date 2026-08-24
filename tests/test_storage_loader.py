@@ -41,5 +41,55 @@ class StorageLoaderZipTests(unittest.TestCase):
         self.assertFalse((root / "cookies.json").exists())
 
 
+class FakeInjectionPage:
+    def __init__(self, error):
+        self.error = error
+        self.closed = False
+
+    async def goto(self, *_args, **_kwargs):
+        raise self.error
+
+    async def evaluate(self, _script):
+        raise AssertionError("evaluate must not run after navigation failure")
+
+    async def close(self):
+        self.closed = True
+
+
+class FakeInjectionContext:
+    def __init__(self, pages):
+        self.pages = list(pages)
+
+    async def add_cookies(self, _cookies):
+        return None
+
+    async def new_page(self):
+        return self.pages.pop(0)
+
+
+class StorageLoaderInjectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_local_and_session_origins_close_temporary_pages(self):
+        local_page = FakeInjectionPage(RuntimeError("local navigation failed"))
+        session_page = FakeInjectionPage(RuntimeError("session navigation failed"))
+        context = FakeInjectionContext([local_page, session_page])
+        loader = object.__new__(StorageLoader)
+        loader.cookies = []
+        loader.local_storage = [{
+            "origin": "https://local.example",
+            "key": "local-key",
+            "value": "local-value",
+        }]
+        loader.session_storage = [{
+            "origin": "https://session.example",
+            "key": "session-key",
+            "value": "session-value",
+        }]
+
+        await loader.inject(context)
+
+        self.assertTrue(local_page.closed)
+        self.assertTrue(session_page.closed)
+
+
 if __name__ == "__main__":
     unittest.main()

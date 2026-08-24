@@ -645,6 +645,7 @@ class OSMConductorBot:
         self._log("[WATCHERS] Opening {} watcher tabs...".format(self.watcher_tabs))
         opened = 0
         for i in range(self.watcher_tabs):
+            page = None
             try:
                 page = await self.context.new_page()
                 await page.goto(OSM_TRAINING, wait_until="domcontentloaded", timeout=60000)
@@ -657,20 +658,35 @@ class OSMConductorBot:
                 self._log("[WATCHERS]   Tab {} opened and started".format(i))
             except Exception as e:
                 self._log("[WATCHERS]   Tab {} failed: {}".format(i, e))
+                if page in self.watcher_pages:
+                    self.watcher_pages.remove(page)
+                try:
+                    if page and not page.is_closed():
+                        await page.close()
+                        self._log("[WATCHERS]   Tab {} failed page closed".format(i))
+                except Exception as close_error:
+                    self._log(
+                        "[WATCHERS]   Tab {} failed page close error: {}".format(
+                            i, close_error
+                        )
+                    )
         self._log("[WATCHERS] {}/{} tabs ready".format(opened, self.watcher_tabs))
 
     async def _close_all_watchers(self):
         self._log("[WATCHERS] Closing all watcher tabs...")
+        pages_before = len(self.context.pages) if self.context else 0
         # Cancel background loops
+        tasks = list(self._watcher_tasks)
         cancelled = 0
-        for t in list(self._watcher_tasks):
+        for t in tasks:
             if not t.done():
                 t.cancel()
                 cancelled += 1
-        self._watcher_tasks.clear()
         self._log("[WATCHERS]   {} loop(s) cancelled".format(cancelled))
-        # Wait for cancel to propagate
-        await asyncio.sleep(1)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._watcher_tasks.clear()
+
         closed = 0
         for page in list(self.watcher_pages):
             try:
@@ -680,11 +696,40 @@ class OSMConductorBot:
             except Exception:
                 pass
         self.watcher_pages.clear()
-        self._log("[WATCHERS]   {}/{} tab(s) closed".format(closed, cancelled))
-        # Double-check no stray pages
-        all_pages = self.context.pages if self.context else []
-        if len(all_pages) > 1:  # conductor + 0 watchters expected
-            self._log("[WATCHERS]   {} total page(s) in context (conductor + watchers)".format(len(all_pages)))
+
+        # Defensive ownership sweep: failed watcher setup paths are not allowed
+        # to leave untracked pages in the shared browser context.
+        stray_closed = 0
+        if self.context:
+            for page in list(self.context.pages):
+                if page is self.conductor_page:
+                    continue
+                try:
+                    if not page.is_closed():
+                        await page.close()
+                        stray_closed += 1
+                except Exception as exc:
+                    self._log(f"[WATCHERS]   stray page close error: {exc}")
+
+        pages_after = len(self.context.pages) if self.context else 0
+        self._log(
+            "[WATCHERS]   page cleanup: pages before={}, tracked_closed={}, "
+            "stray_closed={}, after={}".format(
+                pages_before, closed, stray_closed, pages_after
+            )
+        )
+        expected_after = (
+            1
+            if self.conductor_page
+            and not self.conductor_page.is_closed()
+            else 0
+        )
+        if pages_after > expected_after:
+            self._log(
+                "[WATCHERS]   ! page cleanup incomplete: expected at most {}, got {}".format(
+                    expected_after, pages_after
+                )
+            )
         self._log("[WATCHERS] All watchers confirmed closed")
 
     # ------------------------------------------------------------------
@@ -1099,9 +1144,8 @@ class OSMConductorBot:
             
             # STEP 4: Watcher'lar kapandı veya rate-limit geldi
             # STEP 4b: Tüm watcher tabların kapandığından emin ol
-            if self.watcher_pages or self._watcher_tasks:
-                self._log("[CYCLE] Closing any remaining watchers...")
-                await self._close_all_watchers()
+            self._log("[CYCLE] Closing any remaining watchers...")
+            await self._close_all_watchers()
             
             # Double-check: wait up to 10s for all watcher tabs to actually close
             confirm_wait = 0

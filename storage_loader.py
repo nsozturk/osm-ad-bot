@@ -133,6 +133,7 @@ class StorageLoader:
         for origin, items in origins_local.items():
             if not origin or origin == "null":
                 continue
+            page = None
             try:
                 page = await context.new_page()
                 await page.goto(origin, wait_until="domcontentloaded")
@@ -142,9 +143,14 @@ class StorageLoader:
                     v = json.dumps(it["value"])
                     script += f"try {{ localStorage.setItem({k}, {v}); }} catch(e) {{}}\n"
                 await page.evaluate(script)
-                await page.close()
             except Exception as e:
                 print(f"[!] localStorage inject error for {origin}: {e}")
+            finally:
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
 
         origins_session: dict[str, list[dict]] = {}
         for item in self.session_storage:
@@ -153,6 +159,7 @@ class StorageLoader:
         for origin, items in origins_session.items():
             if not origin or origin == "null":
                 continue
+            page = None
             try:
                 page = await context.new_page()
                 await page.goto(origin, wait_until="domcontentloaded")
@@ -162,6 +169,11 @@ class StorageLoader:
                     v = json.dumps(it["value"])
                     script += f"try {{ sessionStorage.setItem({k}, {v}); }} catch(e) {{}}\n"
                 await page.evaluate(script)
-                await page.close()
             except Exception as e:
                 print(f"[!] sessionStorage inject error for {origin}: {e}")
+            finally:
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
