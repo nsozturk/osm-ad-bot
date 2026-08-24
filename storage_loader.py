@@ -1,5 +1,4 @@
 """Load and inject browser storage dumps into a Playwright context."""
-import asyncio
 import json
 import zipfile
 from pathlib import Path
@@ -139,59 +138,40 @@ class StorageLoader:
         if self.cookies:
             await context.add_cookies(self.cookies)
 
-        # Group storage items by origin to minimise page creation
+        # Install storage before any OSM page JavaScript runs. Opening one
+        # temporary page per origin caused navigation stalls and leaked tabs
+        # whenever an ad-provider origin became unresponsive.
         origins_local: dict[str, list[dict]] = {}
         for item in self.local_storage:
             if not self._is_osm_origin(item["origin"]):
                 continue
-            origins_local.setdefault(item["origin"], []).append(item)
-
-        for origin, items in origins_local.items():
-            if not origin or origin == "null":
-                continue
-            page = None
-            try:
-                page = await context.new_page()
-                await page.goto(origin, wait_until="domcontentloaded")
-                script = ""
-                for it in items:
-                    k = json.dumps(it["key"])
-                    v = json.dumps(it["value"])
-                    script += f"try {{ localStorage.setItem({k}, {v}); }} catch(e) {{}}\n"
-                await page.evaluate(script)
-            except Exception as e:
-                print(f"[!] localStorage inject error for {origin}: {e}")
-            finally:
-                if page is not None:
-                    try:
-                        await asyncio.wait_for(page.close(), timeout=5)
-                    except Exception:
-                        pass
+            origins_local.setdefault(item["origin"], []).append({
+                "key": item["key"], "value": item["value"]
+            })
 
         origins_session: dict[str, list[dict]] = {}
         for item in self.session_storage:
             if not self._is_osm_origin(item["origin"]):
                 continue
-            origins_session.setdefault(item["origin"], []).append(item)
+            origins_session.setdefault(item["origin"], []).append({
+                "key": item["key"], "value": item["value"]
+            })
 
-        for origin, items in origins_session.items():
-            if not origin or origin == "null":
-                continue
-            page = None
-            try:
-                page = await context.new_page()
-                await page.goto(origin, wait_until="domcontentloaded")
-                script = ""
-                for it in items:
-                    k = json.dumps(it["key"])
-                    v = json.dumps(it["value"])
-                    script += f"try {{ sessionStorage.setItem({k}, {v}); }} catch(e) {{}}\n"
-                await page.evaluate(script)
-            except Exception as e:
-                print(f"[!] sessionStorage inject error for {origin}: {e}")
-            finally:
-                if page is not None:
-                    try:
-                        await asyncio.wait_for(page.close(), timeout=5)
-                    except Exception:
-                        pass
+        if not origins_local and not origins_session:
+            return
+
+        local_json = json.dumps(origins_local, separators=(",", ":"))
+        session_json = json.dumps(origins_session, separators=(",", ":"))
+        script = f"""
+            (() => {{
+                const localByOrigin = {local_json};
+                const sessionByOrigin = {session_json};
+                for (const item of (localByOrigin[location.origin] || [])) {{
+                    try {{ localStorage.setItem(item.key, item.value); }} catch (_) {{}}
+                }}
+                for (const item of (sessionByOrigin[location.origin] || [])) {{
+                    try {{ sessionStorage.setItem(item.key, item.value); }} catch (_) {{}}
+                }}
+            }})();
+        """
+        await context.add_init_script(script=script)

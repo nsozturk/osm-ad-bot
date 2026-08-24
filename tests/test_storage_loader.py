@@ -41,37 +41,25 @@ class StorageLoaderZipTests(unittest.TestCase):
         self.assertFalse((root / "cookies.json").exists())
 
 
-class FakeInjectionPage:
-    def __init__(self, error):
-        self.error = error
-        self.closed = False
-
-    async def goto(self, *_args, **_kwargs):
-        raise self.error
-
-    async def evaluate(self, _script):
-        raise AssertionError("evaluate must not run after navigation failure")
-
-    async def close(self):
-        self.closed = True
-
-
 class FakeInjectionContext:
-    def __init__(self, pages):
-        self.pages = list(pages)
+    def __init__(self):
         self.new_page_calls = 0
+        self.init_scripts = []
 
     async def add_cookies(self, _cookies):
         return None
 
     async def new_page(self):
         self.new_page_calls += 1
-        return self.pages.pop(0)
+        raise AssertionError("storage injection must not open temporary pages")
+
+    async def add_init_script(self, *, script):
+        self.init_scripts.append(script)
 
 
 class StorageLoaderInjectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_osm_storage_origins_are_skipped_without_opening_pages(self):
-        context = FakeInjectionContext([])
+        context = FakeInjectionContext()
         loader = object.__new__(StorageLoader)
         loader.cookies = []
         loader.local_storage = [{
@@ -88,11 +76,10 @@ class StorageLoaderInjectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await loader.inject(context)
 
         self.assertEqual(context.new_page_calls, 0)
+        self.assertEqual(context.init_scripts, [])
 
-    async def test_failed_local_and_session_origins_close_temporary_pages(self):
-        local_page = FakeInjectionPage(RuntimeError("local navigation failed"))
-        session_page = FakeInjectionPage(RuntimeError("session navigation failed"))
-        context = FakeInjectionContext([local_page, session_page])
+    async def test_osm_storage_uses_init_script_without_temporary_pages(self):
+        context = FakeInjectionContext()
         loader = object.__new__(StorageLoader)
         loader.cookies = []
         loader.local_storage = [{
@@ -108,8 +95,12 @@ class StorageLoaderInjectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         await loader.inject(context)
 
-        self.assertTrue(local_page.closed)
-        self.assertTrue(session_page.closed)
+        self.assertEqual(context.new_page_calls, 0)
+        self.assertEqual(len(context.init_scripts), 1)
+        self.assertIn("local-key", context.init_scripts[0])
+        self.assertIn("session-key", context.init_scripts[0])
+        self.assertIn("localStorage.setItem", context.init_scripts[0])
+        self.assertIn("sessionStorage.setItem", context.init_scripts[0])
 
 
 if __name__ == "__main__":
