@@ -54,6 +54,19 @@ def make_bot(context, *, watcher_tabs=1, conductor=None):
 
 
 class WatcherOpenLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_page_creation_timeout_does_not_block_remaining_slots(self):
+        class HangingContext:
+            async def new_page(self):
+                await asyncio.Event().wait()
+
+        bot = make_bot(HangingContext())
+
+        await bot._open_watchers(page_create_timeout=0.01)
+
+        self.assertEqual(bot.watcher_pages, [])
+        self.assertEqual(bot._watcher_tasks, [])
+        self.assertTrue(any("Tab 0 failed" in line for line in bot.logs))
+
     async def test_navigation_failure_closes_untracked_page(self):
         page = FakePage(goto_error=RuntimeError("navigation failed"))
         bot = make_bot(FakeContext([page]))

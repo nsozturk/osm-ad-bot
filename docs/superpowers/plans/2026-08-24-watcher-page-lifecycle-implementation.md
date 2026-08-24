@@ -20,6 +20,8 @@
 - [x] Apply bounded close to watcher, scout, and defensive cleanup paths.
 - [x] Add whole-ad-attempt timeout regression coverage.
 - [x] Bound scout and watcher ad attempts while preserving the real-ad wait.
+- [x] Add hanging watcher page-creation regression coverage.
+- [x] Bound watcher `new_page()` protocol calls.
 - [x] Run focused lifecycle tests.
 - [x] Run the complete test suite and compile checks.
 - [ ] Restart the launchd-managed bot.

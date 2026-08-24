@@ -656,13 +656,15 @@ class OSMConductorBot:
             self._log(f"[WATCHERS]   {label} close error: {exc}")
         return False
 
-    async def _open_watchers(self):
+    async def _open_watchers(self, page_create_timeout: float = 15.0):
         self._log("[WATCHERS] Opening {} watcher tabs...".format(self.watcher_tabs))
         opened = 0
         for i in range(self.watcher_tabs):
             page = None
             try:
-                page = await self.context.new_page()
+                page = await asyncio.wait_for(
+                    self.context.new_page(), timeout=page_create_timeout
+                )
                 await page.goto(OSM_TRAINING, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_selector("#page-content", timeout=30000)
                 await asyncio.sleep(2)

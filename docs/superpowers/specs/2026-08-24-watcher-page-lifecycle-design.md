@@ -34,6 +34,8 @@ Use explicit page ownership plus a final context sweep:
    seconds. This still permits the legitimate 120-second fallback wait while
    preventing a stuck renderer protocol call from freezing the scout or watcher
    loop indefinitely.
+8. Creating a watcher page is bounded to 15 seconds because Playwright's
+   `new_page()` protocol request is not covered by navigation timeouts.
 
 This combines precise local cleanup with a defensive recovery seam. Closing
 only failed pages would fix the known path but would not recover pages leaked by
@@ -75,6 +77,7 @@ would be more disruptive and would complicate token/session continuity.
 - Repeated cleanup is safe and retains the conductor-only baseline.
 - A hanging page close times out without blocking the conductor loop.
 - A hanging ad attempt times out and returns control to page cleanup.
+- A hanging watcher page creation times out before the next slot is attempted.
 
 ## Live Verification
 
