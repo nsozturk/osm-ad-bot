@@ -36,6 +36,12 @@ Use explicit page ownership plus a final context sweep:
    loop indefinitely.
 8. Creating a watcher page is bounded to 15 seconds because Playwright's
    `new_page()` protocol request is not covered by navigation timeouts.
+9. Watcher pages are prepared first and their ad tasks start only after the
+   preparation phase finishes. This prevents navigation and ad interaction
+   commands from competing on the same Playwright connection during setup.
+10. The supervised default is reduced from eight to four watcher tabs and can
+    be overridden with `OSM_WATCHER_TABS`. This halves the normal peak page and
+    renderer footprint while retaining parallel ad watching.
 
 This combines precise local cleanup with a defensive recovery seam. Closing
 only failed pages would fix the known path but would not recover pages leaked by
@@ -78,6 +84,7 @@ would be more disruptive and would complicate token/session continuity.
 - A hanging page close times out without blocking the conductor loop.
 - A hanging ad attempt times out and returns control to page cleanup.
 - A hanging watcher page creation times out before the next slot is attempted.
+- Watcher tasks do not start until all successful pages are prepared.
 
 ## Live Verification
 

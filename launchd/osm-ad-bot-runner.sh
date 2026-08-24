@@ -11,6 +11,7 @@ LOG="${OSM_LOG:-${RUNTIME_DIR}/conductor.log}"
 PID_FILE="${RUNTIME_DIR}/conductor.pid"
 HAR_PROFILE="${OSM_TRAINING_HAR:-${SCRIPT_DIR}/en.onlinesoccermanager.com-training.har}"
 PYTHON_BIN="${OSM_PYTHON:-$(command -v python3)}"
+WATCHER_TABS="${OSM_WATCHER_TABS:-4}"
 
 mkdir -p "${RUNTIME_DIR}"
 
@@ -49,7 +50,7 @@ mv "${PID_FILE}.new" "${PID_FILE}"
 ARGS=(
     --dump "${DUMP_PATH}"
     --headless
-    --watcher-tabs 8
+    --watcher-tabs "${WATCHER_TABS}"
     --poll-interval 15
     --ad-duration 120
     --auto-training

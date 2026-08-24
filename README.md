@@ -33,7 +33,7 @@ The normal browser flow uses the live cookies from StorageDump. Client credentia
 python3 osm_ad_bot_conductor.py \
   --dump ~/Downloads/storagedump_en.onlinesoccermanager.com_latest.zip \
   --headless \
-  --watcher-tabs 8 \
+  --watcher-tabs 4 \
   --auto-training \
   --training-har-profile ./en.onlinesoccermanager.com-training.har
 

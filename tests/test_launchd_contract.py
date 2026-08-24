@@ -26,10 +26,12 @@ class LaunchdContractTests(unittest.TestCase):
         self.assertIn("launchctl kickstart -k", source)
         self.assertIn('STAGED_DUMP="${RUNTIME_DIR}/launchd-storage-dump.zip"', source)
         self.assertIn('chmod 600 "${candidate}"', source)
+        self.assertIn('WATCHER_TABS="${OSM_WATCHER_TABS:-4}"', source)
 
     def test_runner_execs_conductor_and_does_not_tail_or_daemonize(self):
         source = RUNNER.read_text(encoding="utf-8")
         self.assertIn('exec "${PYTHON_BIN}" osm_ad_bot_conductor.py', source)
+        self.assertIn('WATCHER_TABS="${OSM_WATCHER_TABS:-4}"', source)
         self.assertNotIn("nohup", source)
         self.assertNotIn("tail -f", source)
 

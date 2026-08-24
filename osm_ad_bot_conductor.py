@@ -658,6 +658,7 @@ class OSMConductorBot:
 
     async def _open_watchers(self, page_create_timeout: float = 15.0):
         self._log("[WATCHERS] Opening {} watcher tabs...".format(self.watcher_tabs))
+        prepared: list[tuple[int, Page]] = []
         opened = 0
         for i in range(self.watcher_tabs):
             page = None
@@ -669,16 +670,26 @@ class OSMConductorBot:
                 await page.wait_for_selector("#page-content", timeout=30000)
                 await asyncio.sleep(2)
                 self.watcher_pages.append(page)
-                t = asyncio.create_task(self._watcher_loop(page, i))
-                self._watcher_tasks.append(t)
-                opened += 1
-                self._log("[WATCHERS]   Tab {} opened and started".format(i))
+                prepared.append((i, page))
+                self._log("[WATCHERS]   Tab {} prepared".format(i))
             except Exception as e:
                 self._log("[WATCHERS]   Tab {} failed: {}".format(i, e))
                 if page in self.watcher_pages:
                     self.watcher_pages.remove(page)
                 if await self._close_page_bounded(page, f"Tab {i} failed page"):
                     self._log("[WATCHERS]   Tab {} failed page closed".format(i))
+
+        for i, page in prepared:
+            try:
+                task = asyncio.create_task(self._watcher_loop(page, i))
+                self._watcher_tasks.append(task)
+                opened += 1
+                self._log("[WATCHERS]   Tab {} started".format(i))
+            except Exception as exc:
+                self._log("[WATCHERS]   Tab {} task failed: {}".format(i, exc))
+                if page in self.watcher_pages:
+                    self.watcher_pages.remove(page)
+                await self._close_page_bounded(page, f"Tab {i} task failure")
         self._log("[WATCHERS] {}/{} tabs ready".format(opened, self.watcher_tabs))
 
     async def _close_all_watchers(self):

@@ -110,6 +110,27 @@ class WatcherOpenLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.watcher_pages, [page])
         self.assertEqual(len(bot._watcher_tasks), 1)
 
+    async def test_all_pages_are_prepared_before_any_watcher_task_starts(self):
+        pages = [FakePage(), FakePage()]
+        bot = make_bot(FakeContext(pages), watcher_tabs=2)
+        prepared_counts = []
+
+        class FakeTask:
+            pass
+
+        def create_task(coroutine):
+            coroutine.close()
+            prepared_counts.append(len(bot.watcher_pages))
+            return FakeTask()
+
+        with (
+            patch("osm_ad_bot_conductor.asyncio.sleep", return_value=None),
+            patch("osm_ad_bot_conductor.asyncio.create_task", side_effect=create_task),
+        ):
+            await bot._open_watchers()
+
+        self.assertEqual(prepared_counts, [2, 2])
+
 
 class WatcherCleanupLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_hanging_page_close_times_out_without_blocking(self):

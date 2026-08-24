@@ -22,6 +22,9 @@
 - [x] Bound scout and watcher ad attempts while preserving the real-ad wait.
 - [x] Add hanging watcher page-creation regression coverage.
 - [x] Bound watcher `new_page()` protocol calls.
+- [x] Add prepare-before-start watcher ordering coverage.
+- [x] Separate watcher page preparation from task activation.
+- [x] Make watcher concurrency configurable with a default of four.
 - [x] Run focused lifecycle tests.
 - [x] Run the complete test suite and compile checks.
 - [ ] Restart the launchd-managed bot.

@@ -24,6 +24,7 @@ PLIST_PATH="${LAUNCH_AGENTS_DIR}/${LABEL}.plist"
 DOMAIN="gui/$(id -u)"
 SERVICE_TARGET="${DOMAIN}/${LABEL}"
 PYTHON_BIN="${OSM_PYTHON:-$(command -v python3)}"
+WATCHER_TABS="${OSM_WATCHER_TABS:-4}"
 
 mkdir -p "${RUNTIME_DIR}"
 
@@ -308,7 +309,7 @@ run_legacy() {
     fi
 
     local args=(
-        --dump "${dump_path}" --headless --watcher-tabs 8 --poll-interval 15
+        --dump "${dump_path}" --headless --watcher-tabs "${WATCHER_TABS}" --poll-interval 15
         --ad-duration 120 --auto-training --training-poll-interval 60 --log "${LOG}"
     )
     if [ -f "${HAR_PROFILE}" ]; then
@@ -377,6 +378,7 @@ echo "PID      : ${PID}"
 echo "Dump     : ${SOURCE_DUMP_PATH}"
 echo "Log      : ${LOG}"
 echo "Training : automatic, forecast-aware (60s poll)"
+echo "Watchers : ${WATCHER_TABS} concurrent tab(s)"
 echo "KeepAlive: enabled; system sleep is not prevented"
 echo "Stop     : ./run.sh stop"
 echo "Status   : ./run.sh status"
