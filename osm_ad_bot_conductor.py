@@ -232,7 +232,7 @@ class OSMConductorBot:
         except Exception as e:
             self._log(f"[CONDUCTOR] wake error: {e}")
 
-    async def _start_mutation_observer(self):
+    async def _start_mutation_observer(self, timeout: float = 5):
         """Install a JS mutation observer that watches for toast/alert nodes
         containing the rate-limit text and pushes cooldown minutes to a
         window.__osm_toast_queue array so we can read it from Python."""
@@ -240,7 +240,7 @@ class OSMConductorBot:
         if not page or page.is_closed():
             return False
         try:
-            installed = await page.evaluate("""
+            installed = await asyncio.wait_for(page.evaluate("""
             () => {
                 if (!document.body) return false;
                 const existing = window.__osm_toast_observer;
@@ -268,7 +268,7 @@ class OSMConductorBot:
                 observer.observe(document.body, { childList: true, subtree: true });
                 return true;
             }
-            """)
+            """), timeout=timeout)
         except Exception as exc:
             if not getattr(self, "_dom_observer_warning_active", False):
                 self._log(f"  [CHECK] DOM toast observer unavailable: {exc}")
@@ -279,7 +279,7 @@ class OSMConductorBot:
             self._log("DOM toast observer installed")
         return bool(installed)
 
-    async def _read_dom_cooldown(self) -> Optional[int]:
+    async def _read_dom_cooldown(self, timeout: float = 5) -> Optional[int]:
         """Read newly-seen cooldown minutes; self-heal after page reloads.
 
         The toast queue and observer are page-scoped JavaScript globals. OSM can
@@ -294,7 +294,7 @@ class OSMConductorBot:
                 return None
 
         try:
-            result = await page.evaluate("""
+            result = await asyncio.wait_for(page.evaluate("""
                 () => {
                     const q = window.__osm_toast_queue;
                     const observer = window.__osm_toast_observer;
@@ -314,7 +314,15 @@ class OSMConductorBot:
                         value: values.length ? Math.max(...values) : null,
                     };
                 }
-            """)
+            """), timeout=timeout)
+        except asyncio.TimeoutError:
+            if not getattr(self, "_dom_check_warning_active", False):
+                self._log(
+                    f"  [CHECK] DOM cooldown check timed out after {timeout:g}s; "
+                    "continuing with API detection"
+                )
+                self._dom_check_warning_active = True
+            return None
         except Exception as exc:
             if not getattr(self, "_dom_check_warning_active", False):
                 self._log(f"  [CHECK] DOM cooldown check interrupted — self-healing: {exc}")

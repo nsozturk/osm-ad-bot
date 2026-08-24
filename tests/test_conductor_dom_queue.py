@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from osm_ad_bot_conductor import OSMConductorBot
@@ -44,6 +45,16 @@ def make_bot(page):
 
 
 class ConductorDomQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hanging_dom_read_times_out_without_blocking_poll_loop(self):
+        class HangingPage(FakePage):
+            async def evaluate(self, _script):
+                await asyncio.Event().wait()
+
+        bot = make_bot(HangingPage())
+
+        self.assertIsNone(await bot._read_dom_cooldown(timeout=0.01))
+        self.assertTrue(any("DOM cooldown check timed out" in line for line in bot.logs))
+
     async def test_park_keeps_osm_page_awake_for_automatic_training(self):
         page = FakePage()
         bot = make_bot(page)
