@@ -89,6 +89,35 @@ With `--auto-training`, the conductor runs a separate, failure-isolated training
 
 The optional Training HAR is a non-secret settings profile. Chrome HAR exports omit usable Authorization and cookie values, so a HAR cannot replace a fresh post-login StorageDump.
 
+## Automatic Free Rewards (Shop -> Featured)
+
+OSM offers periodic free reward bags in the Shop under the Featured / WebShopFree section (Product 653):
+
+- **Continuous & Parallel Mode (High Throughput / Zero Delay)**:
+```bash
+# Run continuous hammering with 5 parallel workers:
+./run_free_reward.sh --continuous --workers 5 --delay 0.5
+
+# Maximum speed (zero delay on success, 0.2s retry on failure):
+./run_free_reward.sh -c -w 5 -d 0.2
+```
+
+- **Single pass or inspection**:
+```bash
+# Single pass check:
+./run_free_reward.sh
+
+# Inspect available free products without purchasing:
+./run_free_reward.sh --dry-run
+
+# Interactive browser with visible UI:
+./run_free_reward.sh --mode browser --headed
+```
+
+- **Integrated into the background conductor (`osm_ad_bot_conductor.py`)**:
+  - Enabled by default (`--auto-free-reward`), checking and claiming available bags and daily bonuses periodically (every 30m).
+  - Can be disabled with `--no-auto-free-reward`.
+
 ## ⚠️ Security Warning
 - **Never commit your storage dump** — it contains authentication tokens.
 - **Never commit HAR files** — they are local diagnostics even when Chrome has redacted their auth headers.

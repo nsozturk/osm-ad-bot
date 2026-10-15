@@ -102,6 +102,27 @@ class StorageLoaderInjectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("localStorage.setItem", context.init_scripts[0])
         self.assertIn("sessionStorage.setItem", context.init_scripts[0])
 
+    async def test_wzrk_keys_are_filtered_from_local_storage(self):
+        context = FakeInjectionContext()
+        loader = object.__new__(StorageLoader)
+        loader.cookies = []
+        loader.local_storage = [{
+            "origin": "https://en.onlinesoccermanager.com",
+            "key": "WZRK_INBOX",
+            "value": "corrupt_data",
+        }, {
+            "origin": "https://en.onlinesoccermanager.com",
+            "key": "valid_key",
+            "value": "valid_value",
+        }]
+        loader.session_storage = []
+
+        await loader.inject(context)
+
+        self.assertEqual(len(context.init_scripts), 1)
+        self.assertNotIn("WZRK_INBOX", context.init_scripts[0])
+        self.assertIn("valid_key", context.init_scripts[0])
+
 
 if __name__ == "__main__":
     unittest.main()

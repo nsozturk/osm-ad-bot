@@ -19,9 +19,30 @@ from urllib.parse import parse_qs
 
 NORMAL_TRAINING_TIMER_ID = 746
 UNIVERSAL_TRAINING_TIMER_ID = 982
-MAX_PLAYER_MAIN_STAT = 200
+BASE_TARGET_MAIN_STAT = 120
+TARGET_STEP = 10
+ABSOLUTE_MAX_MAIN_STAT = 200
+MAX_PLAYER_MAIN_STAT = BASE_TARGET_MAIN_STAT
 UNIVERSAL_ENTITLEMENT_TIMER_TYPE = 16
-MIN_TRAINING_MAIN_STAT = 90
+MIN_TRAINING_MAIN_STAT = 0
+FORECAST_OVERRIDE_MAX_STAT_DEFICIT = 7
+FORECAST_OVERRIDE_MIN_GAIN = 25
+
+
+def resolve_target_cap(
+    eligible_stats: list[int],
+    base_target: int = BASE_TARGET_MAIN_STAT,
+    step: int = TARGET_STEP,
+    max_stat: int = ABSOLUTE_MAX_MAIN_STAT,
+) -> int:
+    if not eligible_stats:
+        return base_target
+    target = base_target
+    while target < max_stat:
+        if any(stat < target for stat in eligible_stats):
+            break
+        target += step
+    return min(target, max_stat)
 
 TRAINERS = {
     1: ("attacker", 1, "forecast"),
@@ -212,13 +233,22 @@ def build_candidate_pool_result(
         player for player in players
         if required_position is None or _safe_int(player.get("position")) == required_position
     ]
+    eligible_squad = [
+        player for player in matching_players
+        if _safe_int(player.get("id"))
+        and _safe_int(player.get("id")) not in transfer_listed_ids
+        and _safe_int(player.get("injuryId")) == 0
+        and player_main_stat(player) >= MIN_TRAINING_MAIN_STAT
+    ]
+    target_cap = resolve_target_cap([player_main_stat(p) for p in eligible_squad])
+
     available_players: list[tuple[dict[str, Any], int, int]] = []
     for player in matching_players:
         player_id = _safe_int(player.get("id"))
         main_stat = player_main_stat(player)
         if not player_id or player_id in occupied_player_ids or player_id in transfer_listed_ids:
             continue
-        if _safe_int(player.get("injuryId")) > 0 or main_stat >= MAX_PLAYER_MAIN_STAT:
+        if _safe_int(player.get("injuryId")) > 0 or main_stat >= target_cap:
             continue
         available_players.append((player, player_id, main_stat))
 
@@ -252,8 +282,8 @@ def build_candidate_pool_result(
 
     candidates.sort(
         key=lambda item: (
-            -item.forecast,
             -item.main_stat,
+            -item.forecast,
             _safe_int(item.player.get("id")),
         )
     )
@@ -261,7 +291,46 @@ def build_candidate_pool_result(
         return CandidatePoolResult(
             [], f"no positive forecast candidate at or above main stat {MIN_TRAINING_MAIN_STAT}"
         )
-    return CandidatePoolResult(candidates)
+    return CandidatePoolResult(rank_candidates(candidates))
+
+
+def rank_candidates(
+    candidates: list[Candidate],
+    max_deficit: int = FORECAST_OVERRIDE_MAX_STAT_DEFICIT,
+    min_gain: int = FORECAST_OVERRIDE_MIN_GAIN,
+) -> list[Candidate]:
+    """Rank candidates with tier-aware efficiency override.
+
+    The primary candidate is the player closest to the target tier (highest
+    main_stat, tie-broken by forecast). A lower-rated player may take priority if
+    they are within `max_deficit` (default 5) rating points of the primary
+    candidate and their training forecast is at least `min_gain` (default 35)
+    points higher than the incumbent.
+    """
+    if len(candidates) <= 1:
+        return list(candidates)
+
+    remaining = sorted(
+        candidates,
+        key=lambda item: (
+            -item.main_stat,
+            -item.forecast,
+            _safe_int(item.player.get("id")),
+        ),
+    )
+    ranked: list[Candidate] = []
+    while remaining:
+        primary = remaining[0]
+        incumbent = primary
+        for challenger in remaining[1:]:
+            if (
+                primary.main_stat - challenger.main_stat <= max_deficit
+                and challenger.forecast >= incumbent.forecast + min_gain
+            ):
+                incumbent = challenger
+        ranked.append(incumbent)
+        remaining.remove(incumbent)
+    return ranked
 
 
 def build_candidate_pool(

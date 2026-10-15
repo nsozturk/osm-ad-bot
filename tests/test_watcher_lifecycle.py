@@ -6,9 +6,10 @@ from osm_ad_bot_conductor import OSMConductorBot
 
 
 class FakePage:
-    def __init__(self, *, goto_error=None, selector_error=None):
+    def __init__(self, *, goto_error=None, selector_error=None, url="https://en.onlinesoccermanager.com/Training"):
         self.goto_error = goto_error
         self.selector_error = selector_error
+        self.url = url
         self.closed = False
         self.close_calls = 0
 
@@ -132,7 +133,67 @@ class WatcherOpenLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepared_counts, [2, 2])
 
 
+class ConductorStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transient_readiness_failure_retries_once_with_a_fresh_page(self):
+        timed_out = FakePage(selector_error=TimeoutError("page content not ready"))
+        ready = FakePage()
+        bot = make_bot(FakeContext([timed_out, ready]))
+        bot._record_daily_metric = lambda _event: None
+
+        async def dismiss_consent(*_args):
+            return None
+
+        bot._dismiss_consent = dismiss_consent
+
+        with patch("osm_ad_bot_conductor.asyncio.sleep", return_value=None):
+            await bot._open_conductor()
+
+        self.assertTrue(timed_out.closed)
+        self.assertIs(bot.conductor_page, ready)
+        self.assertTrue(any("retrying once" in line for line in bot.logs))
+
+    async def test_login_redirect_does_not_retry(self):
+        logged_out = FakePage(
+            selector_error=TimeoutError("page content not ready"),
+            url="https://en.onlinesoccermanager.com/login",
+        )
+        bot = make_bot(FakeContext([logged_out]))
+        bot._record_daily_metric = lambda _event: None
+
+        with self.assertRaisesRegex(RuntimeError, "StorageDump session is no longer valid"):
+            await bot._open_conductor()
+
+        self.assertFalse(logged_out.closed)
+
+
 class WatcherCleanupLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_timeout_does_not_cancel_background_cleanup(self):
+        started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        class SlowClosePage(FakePage):
+            async def close(self):
+                self.close_calls += 1
+                started.set()
+                await allow_close.wait()
+                self.closed = True
+
+        page = SlowClosePage()
+        bot = make_bot(FakeContext([page]))
+
+        close_result = await bot._close_page_bounded(
+            page, "slow close", timeout=0.01
+        )
+
+        self.assertFalse(close_result)
+        await started.wait()
+        self.assertFalse(page.closed)
+        allow_close.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertTrue(page.closed)
+        self.assertEqual(bot._pending_page_close_tasks, set())
+
     async def test_hanging_page_close_times_out_without_blocking(self):
         class HangingClosePage(FakePage):
             async def close(self):
@@ -198,6 +259,36 @@ class WatcherCleanupLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(conductor.closed)
         self.assertEqual(context.pages, [conductor])
+
+    async def test_inject_storage_refreshes_expiring_token(self):
+        bot = object.__new__(OSMConductorBot)
+        bot.logs = []
+        bot._log = bot.logs.append
+        bot.context = object()
+
+        class FakeStorage:
+            def __init__(self):
+                self.cookies = [{"name": "access_token", "value": "old_expired"}]
+                self.injected_context = None
+
+            async def inject(self, context):
+                self.injected_context = context
+
+        bot.storage = FakeStorage()
+
+        refresh_called = []
+        async def fake_refresh(force=False):
+            refresh_called.append(force)
+            return "new_refreshed_token"
+
+        bot._refresh_access_token = fake_refresh
+
+        with patch("osm_ad_bot_conductor._token_expiring", return_value=True):
+            await bot._inject_storage()
+
+        self.assertEqual(refresh_called, [True])
+        self.assertIs(bot.storage.injected_context, bot.context)
+        self.assertTrue(any("Pre-emptively refreshed" in line for line in bot.logs))
 
 
 if __name__ == "__main__":

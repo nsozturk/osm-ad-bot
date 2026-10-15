@@ -11,6 +11,8 @@ from auto_training import (
     build_candidate_pool_result,
     choose_candidate,
     load_training_profile,
+    rank_candidates,
+    resolve_target_cap,
     session_finished,
     session_occupies_slot,
 )
@@ -62,57 +64,59 @@ class AutoTrainingSelectionTests(unittest.TestCase):
         self.assertEqual((profile.league_id, profile.team_id), ("123", "4"))
         self.assertFalse(hasattr(profile, "token"))
 
-    def test_candidate_pool_excludes_below_90_injured_listed_and_occupied(self):
+    def test_candidate_pool_excludes_injured_listed_and_occupied(self):
         players = [
             {"id": 1, "name": "Best", "position": 1, "age": 21, "statAtt": 95, "injuryId": 0},
             {"id": 2, "name": "Edge", "position": 1, "age": 20, "statAtt": 90, "injuryId": 0},
-            {"id": 3, "name": "Below", "position": 1, "age": 19, "statAtt": 89, "injuryId": 0},
+            {"id": 3, "name": "Low", "position": 1, "age": 19, "statAtt": 80, "injuryId": 0},
             {"id": 4, "name": "Injured", "position": 1, "age": 18, "statAtt": 98, "injuryId": 2},
             {"id": 5, "name": "Listed", "position": 1, "age": 18, "statAtt": 97, "injuryId": 0},
             {"id": 6, "name": "Occupied", "position": 1, "age": 18, "statAtt": 96, "injuryId": 0},
         ]
         forecasts = [
             {"playerId": 1, "forecast": 70},
-            {"playerId": 2, "forecast": 92},
-            {"playerId": 3, "forecast": 100},
+            {"playerId": 2, "forecast": 75},
+            {"playerId": 3, "forecast": 80},
             {"playerId": 4, "forecast": 100},
             {"playerId": 5, "forecast": 100},
             {"playerId": 6, "forecast": 100},
         ]
         pool = build_candidate_pool(players, forecasts, 1, {6}, {5})
-        self.assertEqual([item.player["id"] for item in pool], [2, 1])
+        self.assertEqual([item.player["id"] for item in pool], [1, 2, 3])
 
-    def test_main_stat_90_is_included_and_89_is_rejected(self):
+    def test_all_positive_stats_are_eligible_when_floor_is_zero(self):
         players = [
-            {"id": 1, "position": 1, "age": 16, "statAtt": 89},
-            {"id": 2, "position": 1, "age": 40, "statAtt": 90},
+            {"id": 1, "position": 1, "age": 16, "statAtt": 55},
+            {"id": 2, "position": 1, "age": 40, "statAtt": 85},
         ]
         forecasts = [
-            {"playerId": 1, "forecast": 100},
-            {"playerId": 2, "forecast": 60},
+            {"playerId": 1, "forecast": 90},
+            {"playerId": 2, "forecast": 70},
         ]
 
         pool = build_candidate_pool(players, forecasts, 1, set(), set())
 
-        self.assertEqual([item.player["id"] for item in pool], [2])
+        # Player 2 (85) is closest to 120 and deficit is 30 (> 7), so Player 2 stays #1
+        self.assertEqual([item.player["id"] for item in pool], [2, 1])
 
-    def test_goalkeeper_uses_the_same_inclusive_90_threshold(self):
+    def test_goalkeeper_selection_with_zero_floor(self):
         players = [
-            {"id": 1, "position": 4, "age": 18, "statDef": 89},
-            {"id": 2, "position": 4, "age": 34, "statDef": 90},
+            {"id": 1, "position": 4, "age": 18, "statDef": 50},
+            {"id": 2, "position": 4, "age": 34, "statDef": 83},
         ]
         forecasts = [
-            {"playerId": 1, "forecast": 100},
+            {"playerId": 1, "forecast": 93},
             {"playerId": 2, "forecast": 60},
         ]
 
         pool = build_candidate_pool(players, forecasts, 4, set(), set())
         chosen = choose_candidate(pool)
 
-        self.assertEqual([item.player["id"] for item in pool], [2])
+        # Player 2 (83) is closest to 120 (deficit 33 > 7), so Player 2 is chosen
+        self.assertEqual([item.player["id"] for item in pool], [2, 1])
         self.assertEqual(chosen.player["id"], 2)
 
-    def test_highest_forecast_wins_regardless_of_age(self):
+    def test_closest_to_130_wins_regardless_of_forecast_or_age(self):
         players = [
             {"id": 1, "position": 3, "age": 16, "statDef": 99},
             {"id": 2, "position": 3, "age": 39, "statDef": 90},
@@ -124,8 +128,8 @@ class AutoTrainingSelectionTests(unittest.TestCase):
 
         pool = build_candidate_pool(players, forecasts, 3, set(), set())
 
-        self.assertEqual([item.player["id"] for item in pool], [2, 1])
-        self.assertEqual(choose_candidate(pool).player["id"], 2)
+        self.assertEqual([item.player["id"] for item in pool], [1, 2])
+        self.assertEqual(choose_candidate(pool).player["id"], 1)
 
     def test_equal_forecast_prefers_higher_main_stat(self):
         players = [
@@ -140,6 +144,188 @@ class AutoTrainingSelectionTests(unittest.TestCase):
         pool = build_candidate_pool(players, forecasts, 2, set(), set())
 
         self.assertEqual([item.player["id"] for item in pool], [2, 1])
+
+    def test_equal_main_stat_prefers_higher_forecast(self):
+        players = [
+            {"id": 1, "position": 2, "age": 21, "statOvr": 95},
+            {"id": 2, "position": 2, "age": 33, "statOvr": 95},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 70},
+            {"playerId": 2, "forecast": 85},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 2, set(), set())
+
+        self.assertEqual([item.player["id"] for item in pool], [2, 1])
+
+    def test_main_stat_120_and_above_is_excluded_from_candidate_pool(self):
+        players = [
+            {"id": 1, "position": 1, "age": 25, "statAtt": 120},
+            {"id": 2, "position": 1, "age": 26, "statAtt": 121},
+            {"id": 3, "position": 1, "age": 22, "statAtt": 119},
+            {"id": 4, "position": 1, "age": 20, "statAtt": 110},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 50},
+            {"playerId": 2, "forecast": 50},
+            {"playerId": 3, "forecast": 60},
+            {"playerId": 4, "forecast": 70},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 1, set(), set())
+
+        self.assertEqual([item.player["id"] for item in pool], [3, 4])
+        self.assertEqual(choose_candidate(pool).player["id"], 3)
+
+    def test_resolve_target_cap_ladder(self):
+        self.assertEqual(resolve_target_cap([]), 120)
+        self.assertEqual(resolve_target_cap([95, 119]), 120)
+        self.assertEqual(resolve_target_cap([120, 125]), 130)
+        self.assertEqual(resolve_target_cap([130, 135]), 140)
+        self.assertEqual(resolve_target_cap([135, 139]), 140)
+        self.assertEqual(resolve_target_cap([140, 140]), 150)
+        self.assertEqual(resolve_target_cap([190, 195]), 200)
+        self.assertEqual(resolve_target_cap([200, 205]), 200)
+
+    def test_advances_to_140_when_all_position_players_reach_130(self):
+        players = [
+            {"id": 1, "position": 4, "age": 24, "statDef": 133},
+            {"id": 2, "position": 4, "age": 27, "statDef": 130},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 70},
+            {"playerId": 2, "forecast": 75},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 4, set(), set())
+
+        # Target advances to 140. Player 1 (133) is closest to 140.
+        self.assertEqual([item.player["id"] for item in pool], [1, 2])
+        self.assertEqual(choose_candidate(pool).player["id"], 1)
+
+    def test_stops_at_140_until_all_players_in_position_reach_140(self):
+        players = [
+            {"id": 1, "position": 4, "age": 24, "statDef": 140},
+            {"id": 2, "position": 4, "age": 27, "statDef": 130},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 70},
+            {"playerId": 2, "forecast": 75},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 4, set(), set())
+
+        # Target remains 140 because Player 2 < 140. Player 1 (140) is excluded.
+        self.assertEqual([item.player["id"] for item in pool], [2])
+        self.assertEqual(choose_candidate(pool).player["id"], 2)
+
+    def test_advances_to_150_when_all_players_in_position_reach_140(self):
+        players = [
+            {"id": 1, "position": 4, "age": 24, "statDef": 142},
+            {"id": 2, "position": 4, "age": 27, "statDef": 140},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 65},
+            {"playerId": 2, "forecast": 75},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 4, set(), set())
+
+        # All >= 140, target advances to 150. Player 1 (142) chosen first.
+        self.assertEqual([item.player["id"] for item in pool], [1, 2])
+        self.assertEqual(choose_candidate(pool).player["id"], 1)
+
+    def test_universal_trainer_keeps_lowest_squad_tier(self):
+        players = [
+            {"id": 1, "position": 4, "age": 24, "statDef": 133},
+            {"id": 2, "position": 2, "age": 21, "statOvr": 128},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 70, "forecastUniversal": 70},
+            {"playerId": 2, "forecast": 60, "forecastUniversal": 60},
+        ]
+
+        # Universal trainer (5) sees squad minimum tier is 130 because of player 2.
+        # Player 1 (133) is excluded; Player 2 (128) is chosen.
+        pool = build_candidate_pool(players, forecasts, 5, set(), set())
+        self.assertEqual([item.player["id"] for item in pool], [2])
+        self.assertEqual(choose_candidate(pool).player["id"], 2)
+
+    def test_tier_efficiency_override_selects_lower_rated_player_with_high_gain(self):
+        # User scenario: Player 1 at 129 with 10% forecast vs Player 2 at 127 with 100% forecast.
+        # Deficit is 2 (<= 5) and gain is 90 (>= 35), so Player 2 should be chosen first.
+        players = [
+            {"id": 1, "position": 1, "age": 25, "statAtt": 129},
+            {"id": 2, "position": 1, "age": 20, "statAtt": 127},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 10},
+            {"playerId": 2, "forecast": 100},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 1, set(), set())
+        self.assertEqual([item.player["id"] for item in pool], [2, 1])
+        self.assertEqual(choose_candidate(pool).player["id"], 2)
+
+    def test_tier_efficiency_override_rejects_deficit_greater_than_7(self):
+        # Player 1 at 119 with 10% vs Player 2 at 111 with 100%.
+        # Deficit is 8 (> 7), so Player 2 cannot challenge; Player 1 stays first.
+        players = [
+            {"id": 1, "position": 1, "age": 25, "statAtt": 119},
+            {"id": 2, "position": 1, "age": 20, "statAtt": 111},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 10},
+            {"playerId": 2, "forecast": 100},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 1, set(), set())
+        self.assertEqual([item.player["id"] for item in pool], [1, 2])
+        self.assertEqual(choose_candidate(pool).player["id"], 1)
+
+    def test_tier_efficiency_override_rejects_gain_less_than_25(self):
+        # Player 1 at 119 with 60% vs Player 2 at 115 with 84% (gain 24 < 25).
+        # Player 1 stays first.
+        players = [
+            {"id": 1, "position": 1, "age": 25, "statAtt": 119},
+            {"id": 2, "position": 1, "age": 20, "statAtt": 115},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 60},
+            {"playerId": 2, "forecast": 84},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 1, set(), set())
+        self.assertEqual([item.player["id"] for item in pool], [1, 2])
+        self.assertEqual(choose_candidate(pool).player["id"], 1)
+
+        # When Player 2 has 85% (gain 25 >= 25), Player 2 takes priority.
+        forecasts[1]["forecast"] = 85
+        pool = build_candidate_pool(players, forecasts, 1, set(), set())
+        self.assertEqual([item.player["id"] for item in pool], [2, 1])
+        self.assertEqual(choose_candidate(pool).player["id"], 2)
+
+    def test_tier_efficiency_override_multi_challenger_ranking(self):
+        # Player 1: 119 @ 10%
+        # Player 2: 118 @ 80% (beats Player 1: deficit 1, gain 70 >= 25)
+        # Player 3: 117 @ 100% (gain over Player 2 is only 20 < 25, so Player 2 stays #1)
+        players = [
+            {"id": 1, "position": 1, "age": 25, "statAtt": 119},
+            {"id": 2, "position": 1, "age": 22, "statAtt": 118},
+            {"id": 3, "position": 1, "age": 20, "statAtt": 117},
+        ]
+        forecasts = [
+            {"playerId": 1, "forecast": 10},
+            {"playerId": 2, "forecast": 80},
+            {"playerId": 3, "forecast": 100},
+        ]
+
+        pool = build_candidate_pool(players, forecasts, 1, set(), set())
+        # Winner is Player 2. In second round between 3 (117 @ 100) and 1 (119 @ 10),
+        # Player 3 beats Player 1 (deficit 2, gain 90 >= 25).
+        self.assertEqual([item.player["id"] for item in pool], [2, 3, 1])
+        self.assertEqual(choose_candidate(pool).player["id"], 2)
 
     def test_equal_forecast_and_main_stat_prefers_lower_player_id(self):
         players = [
@@ -173,7 +359,7 @@ class AutoTrainingSelectionTests(unittest.TestCase):
 
     def test_empty_pool_reasons_distinguish_forecast_and_unavailable_players(self):
         player = {"id": 1, "position": 1, "age": 21, "statAtt": 90}
-        below = {"id": 2, "position": 1, "age": 18, "statAtt": 89}
+        below = {"id": 2, "position": 1, "age": 18, "statAtt": -1}
 
         no_forecast = build_candidate_pool_result([player], [], 1, set(), set())
         below_floor = build_candidate_pool_result(
@@ -185,11 +371,11 @@ class AutoTrainingSelectionTests(unittest.TestCase):
 
         self.assertEqual(
             no_forecast.empty_reason,
-            "no positive forecast candidate at or above main stat 90",
+            "no positive forecast candidate at or above main stat 0",
         )
         self.assertEqual(
             below_floor.empty_reason,
-            "all available candidates are below main stat 90",
+            "all available candidates are below main stat 0",
         )
         self.assertEqual(
             unavailable.empty_reason,
@@ -209,7 +395,7 @@ class AutoTrainingSelectionTests(unittest.TestCase):
         choices = [choose_candidate(pool).player["id"] for _ in range(20)]
 
         self.assertEqual(len(pool), 7)
-        self.assertEqual(choices, [1] * 20)
+        self.assertEqual(choices, [7] * 20)
 
     def test_finished_session_uses_server_timestamp(self):
         session = {

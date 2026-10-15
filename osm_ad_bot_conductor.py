@@ -19,6 +19,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
@@ -29,6 +30,7 @@ from auto_training import (
     extract_team_context,
     load_training_profile,
 )
+from auto_free_reward import FreeRewardManager
 from storage_loader import StorageLoader
 
 OSM_ORIGIN = "https://en.onlinesoccermanager.com"
@@ -51,6 +53,10 @@ DOM_COOLDOWN_RE = re.compile(
     r"Come\s+back\s+in\s+(\d+)\s+minute",
     re.IGNORECASE,
 )
+SCOUT_RETRY_DELAY_SECONDS = 60
+CONDUCTOR_STARTUP_ATTEMPTS = 2
+CONDUCTOR_STARTUP_RETRY_DELAY_SECONDS = 10
+BROWSER_LAUNCH_TIMEOUT_SECONDS = 45
 
 
 def _jwt_expiry(token: str) -> int:
@@ -81,6 +87,51 @@ class RateLimitInfo:
         return f"RATE-LIMIT ({self.source}) — next ad in {m}m {s}s"
 
 
+class ScoutOutcome(str, Enum):
+    READY = "ready"
+    RATE_LIMITED = "rate_limited"
+    AD_UNAVAILABLE = "ad_unavailable"
+    NAVIGATION_ERROR = "navigation_error"
+
+
+class DailyDomMetrics:
+    """Persist local DOM observations; never present them as ad-network receipts."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.data = self._read()
+
+    def _read(self) -> dict[str, dict[str, Any]]:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(day): entry
+            for day, entry in value.items()
+            if isinstance(entry, dict)
+        }
+
+    def increment(self, event: str, *, now: Optional[datetime] = None) -> int:
+        timestamp = now or datetime.now()
+        day = timestamp.date().isoformat()
+        entry = self.data.setdefault(day, {})
+        current = int(entry.get(event, 0)) + 1
+        entry[event] = current
+        entry["updated_at"] = timestamp.isoformat(timespec="seconds")
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".new")
+        temporary.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.path)
+        return current
+
+
 class OSMConductorBot:
     def __init__(self, dump_dir: str, headless: bool = False,
                  watcher_tabs: int = 1, poll_interval: int = 30,
@@ -89,7 +140,9 @@ class OSMConductorBot:
                  training_poll_interval: int = 60,
                  training_har_profile: Optional[str] = None,
                  normal_training_timer_id: Optional[int] = None,
-                 universal_training_timer_id: Optional[int] = None):
+                 universal_training_timer_id: Optional[int] = None,
+                 auto_free_reward: bool = True,
+                 free_reward_poll_interval: int = 1800):
         self.dump_dir = dump_dir
         self.headless = headless
         self.watcher_tabs = min(watcher_tabs, 9)
@@ -113,6 +166,10 @@ class OSMConductorBot:
         )
         self.training_manager: Optional[AutoTrainingManager] = None
         self._training_task: Optional[asyncio.Task] = None
+        self.auto_free_reward = auto_free_reward
+        self.free_reward_poll_interval = max(60, free_reward_poll_interval)
+        self.free_reward_manager: Optional[FreeRewardManager] = None
+        self._free_reward_task: Optional[asyncio.Task] = None
         # Training and rate-limit checks can hit the API at the same time.
         # Serialize refresh-token rotation so only one request consumes the
         # current refresh token and updates the browser cookies.
@@ -120,7 +177,12 @@ class OSMConductorBot:
         self._token_refresh_warning_active = False
         # Account id derived from the loaded dump's token — never hardcoded.
         self.user_id = self._extract_user_id()
-        self.stats = {"watched": 0, "errors": 0, "cycles": 0}
+        self.stats = {"dom_rewards_detected": 0, "errors": 0, "cycles": 0}
+        self.daily_metrics = (
+            DailyDomMetrics(Path(log_file).resolve().parent / "daily-dom-metrics.json")
+            if log_file
+            else None
+        )
         self._shutdown = False
 
         self.context: Optional[BrowserContext] = None
@@ -143,32 +205,108 @@ class OSMConductorBot:
     def _should_stop(self) -> bool:
         return self._shutdown
 
+    def _record_daily_metric(self, event: str) -> None:
+        metrics = getattr(self, "daily_metrics", None)
+        if not metrics:
+            return
+        try:
+            metrics.increment(event)
+        except OSError as exc:
+            if not getattr(self, "_daily_metrics_warning_active", False):
+                self._log(f"[METRICS] unable to persist local metrics: {exc}")
+                self._daily_metrics_warning_active = True
+
+    def _record_dom_reward_detected(self, prefix: str, source: str) -> None:
+        self.stats["dom_rewards_detected"] += 1
+        self._record_daily_metric("dom_reward_detected")
+        self._log(
+            f"{prefix} ✅ DOM REWARD DETECTED ({source}; local count: "
+            f"{self.stats['dom_rewards_detected']}, not an ad-network receipt)"
+        )
+
     # ------------------------------------------------------------------
     # Browser lifecycle
     # ------------------------------------------------------------------
     async def _create_context(self, playwright):
         self._log("Launching browser...")
-        browser = await playwright.chromium.launch(
-            headless=self.headless,
-            args=[
-                "--mute-audio",
-                "--no-sandbox",
-                # Kill the software-WebGL (swiftshader) GPU process that was
-                # burning ~4 cores: with no real GPU in headless, OSM's
-                # WebGL/canvas was being rasterised on CPU. We fake ad
-                # completion, so we don't need any of it rendered.
-                "--disable-gpu",
-                "--disable-software-rasterizer",
-                "--disable-gpu-compositing",
-                "--disable-accelerated-2d-canvas",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        try:
+            browser = await asyncio.wait_for(
+                playwright.chromium.launch(
+                    headless=self.headless,
+                    args=[
+                        "--mute-audio",
+                        "--no-sandbox",
+                        # Kill the software-WebGL (swiftshader) GPU process that was
+                        # burning ~4 cores: with no real GPU in headless, OSM's
+                        # WebGL/canvas was being rasterised on CPU. We fake ad
+                        # completion, so we don't need any of it rendered.
+                        "--disable-gpu",
+                        "--disable-software-rasterizer",
+                        "--disable-gpu-compositing",
+                        "--disable-accelerated-2d-canvas",
+                        "--disable-dev-shm-usage",
+                        "--disable-webgl",
+                        "--disable-webgl2",
+                        "--disable-3d-apis",
+                    ],
+                ),
+                timeout=BROWSER_LAUNCH_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            self._record_daily_metric("browser_launch_timeout")
+            raise RuntimeError(
+                "Playwright browser launch exceeded "
+                f"{BROWSER_LAUNCH_TIMEOUT_SECONDS}s; letting launchd restart cleanly"
+            ) from exc
         self._log(f"Browser launched (headless={self.headless}, watchers={self.watcher_tabs})")
         ctx = await browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
             locale="en-GB",
+        )
+        # Monkey-patch StoreModal to prevent null.hasOwnProperty crash on setUpClaimDailyReward
+        # when no daily reward timer is active in appViewModel.bossCoinWalletPartial().
+        await ctx.add_init_script(
+            script="""
+            (() => {
+                let _StoreModal = window.StoreModal;
+                const patch = (SM) => {
+                    if (SM && SM.prototype && !SM.prototype._patchedSetUpClaimDailyReward) {
+                        SM.prototype._patchedSetUpClaimDailyReward = true;
+                        SM.prototype.setUpClaimDailyReward = function() {
+                            try {
+                                const e = (window.appViewModel && window.appViewModel.bossCoinWalletPartial)
+                                    ? window.appViewModel.bossCoinWalletPartial()
+                                    : null;
+                                if (e && e.countdownTimer) {
+                                    try { this.dailyRewardClaimTimer(new CountdownTimerPartial(e.countdownTimer)); } catch (_) {}
+                                }
+                                if (e && e.unclaimedCoins) {
+                                    try { this.dailyRewardCounter(new Counter(e.unclaimedCoins)); } catch (_) {}
+                                }
+                            } catch (err) {
+                                console.warn('[Patch] setUpClaimDailyReward suppressed error:', err);
+                            }
+                        };
+                    }
+                };
+                Object.defineProperty(window, 'StoreModal', {
+                    configurable: true,
+                    enumerable: true,
+                    get: () => _StoreModal,
+                    set: (val) => {
+                        _StoreModal = val;
+                        patch(val);
+                    }
+                });
+                const interval = setInterval(() => {
+                    if (window.StoreModal) {
+                        patch(window.StoreModal);
+                    }
+                }, 100);
+                setTimeout(() => clearInterval(interval), 60000);
+            })();
+            """
         )
         # NOTE: do NOT block media/image/font here. The rewarded ad runs in a
         # googlesyndication safeframe whose resources must load for the reward
@@ -179,37 +317,70 @@ class OSMConductorBot:
 
     async def _inject_storage(self):
         self._log("Injecting cookies & storage...")
+        token = self._get_access_token()
+        if not token or _token_expiring(token):
+            refreshed = await self._refresh_access_token(force=True)
+            if refreshed:
+                self._log("Pre-emptively refreshed expired access token before storage injection")
         await self.storage.inject(self.context)
         self._log("Storage injected")
 
     async def _open_conductor(self):
-        self.conductor_page = await self.context.new_page()
-        await self.conductor_page.goto(OSM_TRAINING, wait_until="domcontentloaded", timeout=60000)
-        try:
-            await self.conductor_page.wait_for_selector("#page-content", timeout=30000)
-        except Exception as exc:
-            if "login" in self.conductor_page.url.lower():
-                raise RuntimeError(
-                    "StorageDump session is no longer valid after logout/login; "
-                    "export a fresh post-login StorageDump and run again"
-                ) from exc
-            raise
-        await asyncio.sleep(3)
-        # Accept the consent dialog once — cookies are domain-wide so later tabs stay clean
-        await self._dismiss_consent(self.conductor_page, "[CONDUCTOR]")
-        self._log("Conductor tab ready")
+        """Open the Training page, retrying one transient readiness failure.
+
+        The OSM SPA can return its shell before ``#page-content`` becomes
+        visible.  A single bounded retry avoids handing this short startup
+        race to launchd as a full-process crash.  A login redirect remains a
+        terminal session error and is never retried.
+        """
+        for attempt in range(1, CONDUCTOR_STARTUP_ATTEMPTS + 1):
+            self.conductor_page = await self.context.new_page()
+            try:
+                await self.conductor_page.goto(
+                    OSM_TRAINING, wait_until="domcontentloaded", timeout=60000
+                )
+                await self.conductor_page.wait_for_selector("#page-content", timeout=30000)
+                await asyncio.sleep(3)
+                # Accept the consent dialog once — cookies are domain-wide so later tabs stay clean
+                await self._dismiss_consent(self.conductor_page, "[CONDUCTOR]")
+                self._log("Conductor tab ready")
+                return
+            except Exception as exc:
+                page_url = self.conductor_page.url
+                if "login" in page_url.lower():
+                    raise RuntimeError(
+                        "StorageDump session is no longer valid after logout/login; "
+                        "export a fresh post-login StorageDump and run again"
+                    ) from exc
+
+                if attempt == CONDUCTOR_STARTUP_ATTEMPTS:
+                    self._record_daily_metric("conductor_startup_failure")
+                    raise RuntimeError(
+                        "Training page did not become ready after "
+                        f"{CONDUCTOR_STARTUP_ATTEMPTS} attempts "
+                        f"(last URL: {page_url}; {type(exc).__name__})"
+                    ) from exc
+
+                self._record_daily_metric("conductor_startup_retry")
+                self._log(
+                    "[CONDUCTOR] Training page was not ready "
+                    f"(attempt {attempt}/{CONDUCTOR_STARTUP_ATTEMPTS}; "
+                    f"URL: {page_url}; {type(exc).__name__}); retrying once in "
+                    f"{CONDUCTOR_STARTUP_RETRY_DELAY_SECONDS}s"
+                )
+                await self._close_page_bounded(
+                    self.conductor_page, "startup retry page"
+                )
+                self.conductor_page = None
+                await asyncio.sleep(CONDUCTOR_STARTUP_RETRY_DELAY_SECONDS)
 
     async def _park_conductor(self):
         """During long idle waits, navigate the conductor to about:blank so the
-        OSM SPA stops running its render loop / ad refreshes / timers.
-
-        Automatic training keeps this page awake because the OSM frontend
-        rotates the short-lived access-token cookie used by training API calls.
+        OSM SPA stops running its render loop / ad refreshes / timers. Drops the
+        single idle tab from steady CPU to ~0 while we just sleep.
         """
         try:
             page = self.conductor_page
-            if self.auto_training:
-                return
             if page and not page.is_closed() and page.url != "about:blank":
                 await page.goto("about:blank")
                 self._log("[CONDUCTOR] parked (about:blank) — idle, no CPU")
@@ -374,6 +545,12 @@ class OSMConductorBot:
                         return uid
         return ""
 
+    def _get_access_token(self) -> Optional[str]:
+        for c in self.storage.cookies:
+            if c["name"] == "access_token":
+                return c["value"]
+        return None
+
     def _get_refresh_token(self) -> Optional[str]:
         for c in self.storage.cookies:
             if c["name"] == "refresh_token":
@@ -536,9 +713,9 @@ class OSMConductorBot:
             async with httpx.AsyncClient() as client:
                 if payload is None:
                     request_body = {}
-                elif endpoint.rstrip("/").endswith("/trainingsessions"):
-                    # The live Training page submits application/x-www-form-urlencoded
-                    # fields (confirmed by the supplied HAR), not a JSON wrapper.
+                elif endpoint.rstrip("/").endswith(
+                    ("/trainingsessions", "/bosscoinstorepurchase/process", "/consumereward")
+                ):
                     request_body = {"data": payload}
                     headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
                 else:
@@ -553,6 +730,9 @@ class OSMConductorBot:
                     live_token = await self._get_live_access_token()
                     if not live_token or live_token == token or _token_expiring(live_token):
                         live_token = await self._refresh_access_token(force=True)
+                    if not live_token and self.context:
+                        await self._ensure_conductor_awake()
+                        live_token = await self._get_live_access_token()
                     if live_token:
                         headers["Authorization"] = f"Bearer {live_token}"
                         resp = await client.request(
@@ -615,6 +795,7 @@ class OSMConductorBot:
         return f"{m}m {s}s"
 
     async def _wait_rate_limit(self, info: RateLimitInfo):
+        self._record_daily_metric("rate_limit_cooldown")
         self._log(f"⛔ RATE-LIMIT ({info.source}): Waiting {self._fmt_cooldown(info.cooldown_seconds)}")
         # Close all watcher tabs immediately
         await self._close_all_watchers()
@@ -652,14 +833,43 @@ class OSMConductorBot:
     async def _close_page_bounded(
         self, page: Optional[Page], label: str, timeout: float = 5.0
     ) -> bool:
-        """Close a page without allowing an unresponsive renderer to stall."""
+        """Close a page without allowing an unresponsive renderer to stall.
+
+        ``asyncio.wait_for(page.close())`` cancels the underlying close when
+        the timeout expires. Playwright can then retain the half-closed page
+        in the shared context, which eventually starves later navigations.
+        Shield the close task instead: callers stay bounded while the browser
+        is allowed to finish cleaning up in the background.
+        """
         if not page or page.is_closed():
             return True
+        close_task = asyncio.create_task(page.close())
+        pending_closes = getattr(self, "_pending_page_close_tasks", None)
+        if pending_closes is None:
+            pending_closes = set()
+            self._pending_page_close_tasks = pending_closes
+        pending_closes.add(close_task)
+
+        def _discard_finished_close(task: asyncio.Task) -> None:
+            pending_closes.discard(task)
+            if task.cancelled():
+                return
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                return
+            if exc:
+                self._log(f"[WATCHERS]   {label} background close error: {exc}")
+
+        close_task.add_done_callback(_discard_finished_close)
         try:
-            await asyncio.wait_for(page.close(), timeout=timeout)
+            await asyncio.wait_for(asyncio.shield(close_task), timeout=timeout)
             return True
         except asyncio.TimeoutError:
-            self._log(f"[WATCHERS]   {label} close timeout after {timeout:g}s")
+            self._log(
+                f"[WATCHERS]   {label} close timeout after {timeout:g}s; "
+                "cleanup continues in background"
+            )
         except Exception as exc:
             self._log(f"[WATCHERS]   {label} close error: {exc}")
         return False
@@ -681,6 +891,7 @@ class OSMConductorBot:
                 prepared.append((i, page))
                 self._log("[WATCHERS]   Tab {} prepared".format(i))
             except Exception as e:
+                self._record_daily_metric("watcher_setup_failure")
                 self._log("[WATCHERS]   Tab {} failed: {}".format(i, e))
                 if page in self.watcher_pages:
                     self.watcher_pages.remove(page)
@@ -916,6 +1127,7 @@ class OSMConductorBot:
                 self._watch_single_ad(page, tab_id), timeout=limit
             )
         except asyncio.TimeoutError:
+            self._record_daily_metric("ad_attempt_timeout")
             self._log(
                 f"[W{tab_id}] ! ad attempt timeout after {limit:g}s; closing page"
             )
@@ -931,7 +1143,10 @@ class OSMConductorBot:
             # Open shop
             self._log(f"{prefix}   Opening shop...")
             body = await page.query_selector("body.modal-open")
-            if not body:
+            shop_open = False
+            if body:
+                shop_open = bool(await page.query_selector(".modal-dialog .products-container, #modal-container .products-container"))
+            if not shop_open:
                 # Give the wallet up to 10s to render (slower under load / GPU-off)
                 # instead of failing on an immediate miss.
                 try:
@@ -957,6 +1172,10 @@ class OSMConductorBot:
 
             # Find button
             self._log(f"{prefix}   Looking for 'Watch ad' button...")
+            try:
+                await page.wait_for_selector(SELECTORS["watch_ad_btn"], timeout=5000)
+            except Exception:
+                pass
             buttons = await page.query_selector_all(SELECTORS["watch_ad_btn"])
             if not buttons:
                 # When the shop can't load the ad slot, OSM pops a generic
@@ -1016,8 +1235,7 @@ class OSMConductorBot:
                 await asyncio.sleep(1)
 
             if rewarded:
-                self.stats["watched"] += 1
-                self._log(f"{prefix} ✅ REWARD CONFIRMED (total watched: {self.stats['watched']})")
+                self._record_dom_reward_detected(prefix, "initial DOM probe")
                 return True
 
             # No reward yet — wait real ad duration
@@ -1042,8 +1260,7 @@ class OSMConductorBot:
             try:
                 reward = await page.query_selector(".modal-dialog .reward-container, .consumable-image-tile")
                 if reward:
-                    self.stats["watched"] += 1
-                    self._log(f"{prefix} ✅ REWARD AFTER WAIT (total watched: {self.stats['watched']})")
+                    self._record_dom_reward_detected(prefix, "post-wait DOM probe")
                     return True
             except Exception:
                 pass
@@ -1067,10 +1284,9 @@ class OSMConductorBot:
     # ------------------------------------------------------------------
     # Main conductor loop
     # ------------------------------------------------------------------
-    async def _scout_check(self) -> bool:
+    async def _scout_check(self) -> ScoutOutcome:
         """Open 1 scout tab, try to watch an ad, then check if rate-limit appeared.
-        Returns True if ad was watched AND no rate-limit after watching.
-        Returns False if rate-limited (will wait cooldown)."""
+        Distinguishes a real cooldown from unavailable ad/UI and navigation errors."""
         self._log("[SCOUT] Step 1/3: Opening scout tab...")
         scout = await self.context.new_page()
         try:
@@ -1091,19 +1307,38 @@ class OSMConductorBot:
                 self._log("[SCOUT] ⛔ Rate-limit ACTIVE after ad (cooldown: {}).".format(
                     self._fmt_cooldown(api_limit.cooldown_seconds)))
                 await self._wait_rate_limit(api_limit)
-                return False
+                return ScoutOutcome.RATE_LIMITED
             
             if ok:
-                self._log("[SCOUT] ✅ Ad watched + NO rate-limit after. Safe to open watchers.")
-                return True
+                self._log("[SCOUT] ✅ Local DOM reward + no rate-limit. Safe to open watchers.")
+                return ScoutOutcome.READY
             else:
-                self._log("[SCOUT] ⚠️ Ad failed but no rate-limit. Will retry scout.")
-                return False
+                self._log("[SCOUT] ⚠️ Ad/UI unavailable but no rate-limit.")
+                return ScoutOutcome.AD_UNAVAILABLE
                 
         except Exception as e:
-            self._log("[SCOUT] ! Error: {}".format(e))
+            url_info = ""
+            try:
+                url_info = f" (url={scout.url})"
+            except Exception:
+                pass
+            self._log(f"[SCOUT] ! Error{url_info}: {e}")
             await self._close_page_bounded(scout, "scout failure")
-            return False
+            return ScoutOutcome.NAVIGATION_ERROR
+
+    async def _wait_for_scout_retry(self, outcome: ScoutOutcome) -> None:
+        event = (
+            "scout_ad_unavailable"
+            if outcome is ScoutOutcome.AD_UNAVAILABLE
+            else "scout_navigation_error"
+        )
+        self._record_daily_metric(event)
+        self._log(
+            f"[SCOUT] {outcome.value}; waiting {SCOUT_RETRY_DELAY_SECONDS}s before retry "
+            "(not a rate-limit cooldown)."
+        )
+        await self._park_conductor()
+        await asyncio.sleep(SCOUT_RETRY_DELAY_SECONDS)
 
     async def _conductor_loop(self):
         """Forever loop:
@@ -1119,21 +1354,43 @@ class OSMConductorBot:
         self._log("  Min ad duration: {}s (2 min)".format(self.ad_duration))
         self._log("═══════════════════════════════════════════")
         
+        consecutive_nav_errors = 0
         while not self._should_stop():
             self.stats["cycles"] += 1
             self._log("")
             self._log("═══════════════════════════════════════════")
             self._log("  CYCLE #{}".format(self.stats['cycles']))
-            self._log("  Watched so far: {} | Errors: {}".format(self.stats['watched'], self.stats['errors']))
+            self._log(
+                "  DOM rewards detected so far: {} | Errors: {}".format(
+                    self.stats["dom_rewards_detected"], self.stats["errors"]
+                )
+            )
             self._log("═══════════════════════════════════════════")
 
             # STEP 1: Scout check — 1 tab ile rate-limit test et
-            scout_ok = await self._scout_check()
+            scout_outcome = await self._scout_check()
             
-            if not scout_ok:
-                # Rate-limit active, already waited in _scout_check
-                self._log("[CYCLE] Scout reported rate-limit. Looping back to scout check...")
+            if scout_outcome is not ScoutOutcome.READY:
+                if scout_outcome is ScoutOutcome.RATE_LIMITED:
+                    consecutive_nav_errors = 0
+                    self._log("[CYCLE] Rate-limit cooldown handled. Looping back to scout check...")
+                elif scout_outcome is ScoutOutcome.NAVIGATION_ERROR:
+                    consecutive_nav_errors += 1
+                    if consecutive_nav_errors >= 5:
+                        self._log(
+                            f"[CYCLE] ⛔ Exceeded {consecutive_nav_errors} consecutive scout navigation errors; "
+                            "exiting to let launchd cleanly restart with a fresh browser"
+                        )
+                        raise RuntimeError(
+                            f"Exceeded {consecutive_nav_errors} consecutive scout navigation errors"
+                        )
+                    await self._wait_for_scout_retry(scout_outcome)
+                else:
+                    consecutive_nav_errors = 0
+                    await self._wait_for_scout_retry(scout_outcome)
                 continue
+            
+            consecutive_nav_errors = 0
             
             # STEP 2: Rate-limit YOK — tüm watcher tablarını aç
             # Wake the conductor back onto OSM (it may have been parked during the
@@ -1169,8 +1426,8 @@ class OSMConductorBot:
                     await self._wait_rate_limit(dom_limit)
                     break
                 
-                self._log("[POLL #{}] ✅ {} watcher(s) still running. Watched: {}".format(
-                    poll_count, len(self.watcher_pages), self.stats['watched']))
+                self._log("[POLL #{}] ✅ {} watcher(s) still running. DOM rewards: {}".format(
+                    poll_count, len(self.watcher_pages), self.stats['dom_rewards_detected']))
             
             # STEP 4: Watcher'lar kapandı veya rate-limit geldi
             # STEP 4b: Tüm watcher tabların kapandığından emin ol
@@ -1190,8 +1447,8 @@ class OSMConductorBot:
                         await self._close_page_bounded(p, "confirmation watcher")
                     self.watcher_pages.clear()
             
-            self._log("[CYCLE] ✅ All watchers confirmed closed. {} ads watched this cycle.".format(
-                self.stats['watched']))
+            self._log("[CYCLE] ✅ All watchers confirmed closed. {} local DOM rewards detected this run.".format(
+                self.stats['dom_rewards_detected']))
             
             # STEP 5: 5 dk bekle, sonra tekrar scout check
             # Park the conductor for the idle gap so it draws ~0 CPU while waiting.
@@ -1239,12 +1496,28 @@ class OSMConductorBot:
                         "[TRAINING] disabled: league/team context was not found in "
                         "the StorageDump or HAR profile"
                     )
+            if self.auto_free_reward:
+                self.free_reward_manager = FreeRewardManager(
+                    api_request=self._api_request,
+                    log=self._log,
+                    poll_interval=self.free_reward_poll_interval,
+                    should_stop=self._should_stop,
+                    claim_daily_bonus=True,
+                )
+                self._free_reward_task = asyncio.create_task(
+                    self.free_reward_manager.run(), name="osm-auto-free-reward"
+                )
             try:
                 await self._conductor_loop()
             finally:
-                if self._training_task and not self._training_task.done():
-                    self._training_task.cancel()
-                    await asyncio.gather(self._training_task, return_exceptions=True)
+                tasks_to_cancel = [
+                    t for t in (self._training_task, self._free_reward_task)
+                    if t and not t.done()
+                ]
+                if tasks_to_cancel:
+                    for t in tasks_to_cancel:
+                        t.cancel()
+                    await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
     def print_summary(self):
         self._log("")
@@ -1252,15 +1525,22 @@ class OSMConductorBot:
         self._log("           FINAL SUMMARY")
         self._log("═══════════════════════════════════════════")
         self._log("  Total Cycles      : {}".format(self.stats['cycles']))
-        self._log("  Ads Watched       : {}".format(self.stats['watched']))
+        self._log("  DOM Rewards Detected : {}".format(self.stats['dom_rewards_detected']))
         self._log("  Errors            : {}".format(self.stats['errors']))
-        self._log("  BossCoins Earned  : ~{}".format(self.stats['watched']))
+        self._log("  BossCoins Earned  : not verified locally")
         if self.training_manager:
             self._log("  Trainings Claimed : {}".format(
                 self.training_manager.stats["claimed"]
             ))
             self._log("  Trainings Started : {}".format(
                 self.training_manager.stats["started"]
+            ))
+        if self.free_reward_manager:
+            self._log("  Free Rewards Claimed: {}".format(
+                self.free_reward_manager.stats["claims_count"]
+            ))
+            self._log("  Free Coins Gained   : {}".format(
+                self.free_reward_manager.stats["coins_gained"]
             ))
             self._log("  Training Errors   : {}".format(
                 self.training_manager.stats["errors"]
@@ -1293,6 +1573,12 @@ def main():
                         help="Override normal trainer timer setting ID")
     parser.add_argument("--universal-training-timer-id", type=int,
                         help="Override universal trainer timer setting ID")
+    parser.add_argument("--auto-free-reward", action="store_true", default=True,
+                        help="Automatically claim free store rewards and daily bonus (default True)")
+    parser.add_argument("--no-auto-free-reward", dest="auto_free_reward", action="store_false",
+                        help="Disable automatic free store reward claims")
+    parser.add_argument("--free-reward-poll-interval", type=int, default=1800,
+                        help="Seconds between automatic free reward checks (default 1800)")
     parser.add_argument("--log", help="Log file path")
     args = parser.parse_args()
 
@@ -1308,6 +1594,8 @@ def main():
         training_har_profile=args.training_har_profile,
         normal_training_timer_id=args.normal_training_timer_id,
         universal_training_timer_id=args.universal_training_timer_id,
+        auto_free_reward=args.auto_free_reward,
+        free_reward_poll_interval=args.free_reward_poll_interval,
     )
 
     signal.signal(signal.SIGINT, bot.shutdown)

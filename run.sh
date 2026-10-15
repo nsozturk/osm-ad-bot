@@ -62,6 +62,10 @@ select_dump() {
         done < <(find "${DOWNLOADS_DIR}" -maxdepth 1 \
             -name 'storagedump_en.onlinesoccermanager.com_*' -print | sort -r)
     fi
+    if [ -f "${STAGED_DUMP}" ]; then
+        printf '%s\n' "${STAGED_DUMP}"
+        return 0
+    fi
     echo "ERROR: No StorageDump directory or ZIP found." >&2
     echo "Export a fresh StorageDump after logging in, then run:" >&2
     echo "  ./run.sh /absolute/path/to/storagedump_en.onlinesoccermanager.com_....zip" >&2
@@ -75,6 +79,18 @@ launchd_loaded() {
 launchd_pid() {
     launchctl print "${SERVICE_TARGET}" 2>/dev/null \
         | awk '/^[[:space:]]*pid = / { print $3; exit }'
+}
+
+launchd_conductor_pid() {
+    local pid command_line
+    pid="$(launchd_pid || true)"
+    [ -n "${pid}" ] || return 1
+    command_line="$(ps -p "${pid}" -o command= 2>/dev/null || true)"
+    if [[ "${command_line}" == *"osm_ad_bot_conductor.py"* ]]; then
+        printf '%s\n' "${pid}"
+        return 0
+    fi
+    return 1
 }
 
 launchd_state() {
@@ -91,7 +107,10 @@ generate_plist() {
     plutil -insert WorkingDirectory -string "${SCRIPT_DIR}" "${target}"
     plutil -insert RunAtLoad -bool YES "${target}"
     plutil -insert KeepAlive -bool YES "${target}"
-    plutil -insert ProcessType -string Background "${target}"
+    # The bot already bounds browser work itself.  Standard avoids the
+    # Background-class scheduling path that can leave the LaunchAgent at an
+    # xpcproxy without ever exec'ing the runner on current macOS releases.
+    plutil -insert ProcessType -string Standard "${target}"
     plutil -insert ThrottleInterval -integer 15 "${target}"
     plutil -insert StandardOutPath -string "${LAUNCHD_LOG}" "${target}"
     plutil -insert StandardErrorPath -string "${LAUNCHD_LOG}" "${target}"
@@ -198,7 +217,7 @@ stage_dump_for_launchd() {
 wait_for_launchd_pid() {
     local pid=""
     for _ in $(seq 1 30); do
-        pid="$(launchd_pid || true)"
+        pid="$(launchd_conductor_pid || true)"
         if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
             printf '%s\n' "${pid}"
             return 0
@@ -216,7 +235,7 @@ print_status() {
         echo "Plist      : ${PLIST_PATH}"
         return 1
     fi
-    pid="$(launchd_pid || true)"
+    pid="$(launchd_conductor_pid || true)"
     state="$(launchd_state || true)"
     if [ -f "${SOURCE_DUMP_CONFIG}" ]; then
         selected="$(head -n 1 "${SOURCE_DUMP_CONFIG}")"
@@ -225,7 +244,7 @@ print_status() {
     fi
     echo "LaunchAgent: loaded"
     echo "State      : ${state:-unknown}"
-    echo "PID        : ${pid:-restarting}"
+    echo "PID        : ${pid:-not-yet-execed}"
     echo "Dump       : ${selected:-not selected}"
     echo "Log        : ${LOG}"
     echo "Launchd log: ${LAUNCHD_LOG}"

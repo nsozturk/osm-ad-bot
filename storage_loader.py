@@ -145,6 +145,8 @@ class StorageLoader:
         for item in self.local_storage:
             if not self._is_osm_origin(item["origin"]):
                 continue
+            if item.get("key", "").startswith("WZRK_"):
+                continue
             origins_local.setdefault(item["origin"], []).append({
                 "key": item["key"], "value": item["value"]
             })
@@ -164,6 +166,14 @@ class StorageLoader:
         session_json = json.dumps(origins_session, separators=(",", ":"))
         script = f"""
             (() => {{
+                try {{
+                    for (let i = localStorage.length - 1; i >= 0; i--) {{
+                        const k = localStorage.key(i);
+                        if (k && k.startsWith("WZRK_")) {{
+                            localStorage.removeItem(k);
+                        }}
+                    }}
+                }} catch (_) {{}}
                 const localByOrigin = {local_json};
                 const sessionByOrigin = {session_json};
                 for (const item of (localByOrigin[location.origin] || [])) {{

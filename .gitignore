@@ -24,3 +24,5 @@ storagedump_*.zip
 # Transfer advisor derived data
 transfer-advisor/data/
 tmp/
+osm-latest/
+.DS_Store

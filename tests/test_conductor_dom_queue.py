@@ -55,19 +55,10 @@ class ConductorDomQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await bot._read_dom_cooldown(timeout=0.01))
         self.assertTrue(any("DOM cooldown check timed out" in line for line in bot.logs))
 
-    async def test_park_keeps_osm_page_awake_for_automatic_training(self):
+    async def test_park_uses_blank_page_for_idle_cpu_reduction(self):
         page = FakePage()
         bot = make_bot(page)
         bot.auto_training = True
-
-        await bot._park_conductor()
-
-        self.assertEqual(page.goto_calls, [])
-        self.assertTrue(page.url.startswith("https://en.onlinesoccermanager.com"))
-
-    async def test_park_uses_blank_page_without_automatic_training(self):
-        page = FakePage()
-        bot = make_bot(page)
 
         await bot._park_conductor()
 
